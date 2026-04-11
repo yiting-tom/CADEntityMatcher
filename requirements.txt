@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+ezdxf
+shapely
+python-multipart
+pillow
