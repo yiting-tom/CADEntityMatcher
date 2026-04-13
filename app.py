@@ -9,49 +9,51 @@ from pydantic import BaseModel
 import ezdxf
 from ezdxf.bbox import extents
 from ezdxf.addons.drawing import Frontend, RenderContext, layout
+from ezdxf.addons.drawing.config import Configuration
 from ezdxf.addons.drawing.svg import SVGBackend
 from shapely.geometry import Point, LineString, Polygon as ShapelyPolygon
 from shapely.ops import linemerge
 
-# 初始化 FastAPI
+# Initialize FastAPI app
 app = FastAPI()
 
-# 暫存檔路徑
+# Temporary upload path
 TEMP_DXF_PATH = "temp_uploaded.dxf"
 
-# --- 演算法常數 ---
-SNAP_DECIMALS = 6  # 端點對齊精度 (確保 linemerge 能正確縫合)
-SIZE_TOL_RATIO = 0.05  # 尺寸容差比例 (5%)
-SIZE_TOL_MIN = 0.05  # 尺寸最小絕對容差
-DIST_TOL_RATIO = 0.05  # 距離容差比例 (5%)
-DIST_TOL_MIN = 0.1  # 距離最小絕對容差
+# --- Algorithm constants ---
+SNAP_DECIMALS = 6  # Endpoint rounding precision for stable linemerge stitching
+SIZE_TOL_RATIO = 0.05  # Relative size tolerance ratio (5%)
+SIZE_TOL_MIN = 0.05  # Minimum absolute size tolerance
+DIST_TOL_RATIO = 0.05  # Relative distance tolerance ratio (5%)
+DIST_TOL_MIN = 0.1  # Minimum absolute distance tolerance
+SVG_LINEWEIGHT_SCALING = 0.2  # Make preview SVG strokes thinner
 
 
 def snap(val):
-    """將座標值四捨五入到固定精度，確保 linemerge 端點對齊"""
+    """Round coordinates to fixed precision for stable linemerge endpoints."""
     return round(val, SNAP_DECIMALS)
 
 
-# --- Pydantic 模型 (統一的幾何指紋) ---
+# --- Pydantic models (normalized geometry fingerprint) ---
 class EntityModel(BaseModel):
     type: str  # CIRCLE, COMPOSITE_SHAPE
-    size: float  # 半徑 或 總周長/長度
-    x: float  # 幾何中心 X
-    y: float  # 幾何中心 Y
+    size: float  # Radius or total length/perimeter
+    x: float  # Geometry center X
+    y: float  # Geometry center Y
 
 
 class TemplateModel(BaseModel):
     entities: list[EntityModel]
 
 
-# --- 幾何計算輔助函數 ---
+# --- Geometry helper functions ---
 def calculate_distance(p1, p2):
-    """計算兩點之間的直線距離"""
+    """Calculate Euclidean distance between two points."""
     return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
 
 
 def geometry_to_render_pct(geom, bounds):
-    """將 DXF 幾何座標轉換為 SVG 渲染百分比座標"""
+    """Convert DXF geometry coordinates to SVG render percentage coordinates."""
     w, h = bounds["width"], bounds["height"]
     min_x, max_y = bounds["min_x"], bounds["max_y"]
     if geom["kind"] == "circle":
@@ -71,7 +73,7 @@ def geometry_to_render_pct(geom, bounds):
 
 
 def get_dxf_bounds(msp):
-    """取得 DXF 的邊界與寬高"""
+    """Get DXF extents and dimensions."""
     ext = extents(msp)
     return {
         "min_x": ext.extmin.x,
@@ -85,11 +87,11 @@ def get_dxf_bounds(msp):
 
 def extract_template_features(msp, roi_box=None):
     """
-    智慧特徵擷取 v2：
-    1. 永遠對全圖做 global linemerge，確保框選與掃描的拓撲一致
-    2. 支援 CIRCLE, LINE, LWPOLYLINE, ARC, POLYLINE, ELLIPSE, SPLINE
-    3. 端點 snap 對齊，提高 linemerge 成功率
-    4. 最後才用 ROI 過濾 (centroid 在 ROI 內)
+    Smart feature extraction v2:
+    1. Always run global linemerge on the whole drawing for topology consistency.
+    2. Supports CIRCLE, LINE, LWPOLYLINE, ARC, POLYLINE, ELLIPSE, SPLINE.
+    3. Snap endpoints to improve linemerge stability.
+    4. Apply ROI filtering last (centroid must be inside ROI).
     """
     circles = []
     all_lines = []
@@ -169,7 +171,7 @@ def extract_template_features(msp, roi_box=None):
             except Exception:
                 pass
 
-    # --- Global linemerge：永遠合併全圖，確保拓撲一致 ---
+    # --- Global linemerge: always merge the full drawing for consistent topology ---
     features = list(circles)
     if all_lines:
         merged_result = linemerge(all_lines)
@@ -194,7 +196,7 @@ def extract_template_features(msp, roi_box=None):
                 }
             )
 
-    # --- ROI 過濾：以 centroid 是否在 ROI 內為準 ---
+    # --- ROI filtering: keep features whose centroids are inside ROI ---
     if roi_box is not None:
         features = [
             f for f in features if roi_box.contains(Point(f["x"], f["y"]))
@@ -203,12 +205,12 @@ def extract_template_features(msp, roi_box=None):
     return features
 
 
-# --- 全域快取 (upload 後一次性計算) ---
+# --- Global cache (computed once after upload) ---
 _cache = {"ready": False}
 
 
 def _build_cache(msp):
-    """Upload 後一次性計算並快取所有指紋與空間索引"""
+    """Compute and cache all fingerprints and spatial indexes once after upload."""
     bounds = get_dxf_bounds(msp)
     fingerprints = extract_template_features(msp, roi_box=None)
 
@@ -222,7 +224,7 @@ def _build_cache(msp):
         sizes = np.empty(0)
         tree = None
 
-    # 按 type 建立 numpy index，加速粗篩
+    # Build per-type numpy indexes for fast pre-filtering
     type_index = {}
     for idx, f in enumerate(fingerprints):
         type_index.setdefault(f["type"], []).append(idx)
@@ -242,14 +244,14 @@ def _build_cache(msp):
 
 
 def _find_matching(adj):
-    """Kuhn's algorithm 求最大二部圖匹配。
+    """Kuhn's algorithm for maximum bipartite matching.
     adj[i] = list of right-node indices that left node i can match to.
-    回傳 matched right indices set (perfect matching) 或 None。
+    Returns matched right index set (perfect matching) or None.
     """
     n = len(adj)
     if n == 0:
         return set()
-    match_r = {}  # right → left
+    match_r = {}  # right -> left
 
     def _augment(u, visited):
         for v in adj[u]:
@@ -260,21 +262,21 @@ def _find_matching(adj):
                     return True
         return False
 
-    # most-constrained-first：候選最少的 target 先處理，加速收斂
+    # Most-constrained-first: match target with fewest candidates first
     order = sorted(range(n), key=lambda i: len(adj[i]))
     for u in order:
         if not _augment(u, set()):
-            return None  # 此節點無法配對 → 不存在 perfect matching
+            return None  # This node cannot be matched -> no perfect matching
     return set(match_r.keys())
 
 
 def _pick_anchor(entities, type_index, sizes):
-    """選擇全圖候選數量最少的實體作為 anchor (最稀有 = 最快收斂)。"""
+    """Pick the entity with the fewest global candidates as anchor (rarest first)."""
     best_idx, best_cnt = 0, float("inf")
     for i, e in enumerate(entities):
         t = e["type"]
         if t not in type_index:
-            return i  # 全圖找不到此 type → 0 candidates，直接選它 (會快速結束)
+            return i  # Type not found globally -> 0 candidates; fast fail
         tol = max(SIZE_TOL_MIN, e["size"] * SIZE_TOL_RATIO)
         cnt = int(np.sum(np.abs(sizes[type_index[t]] - e["size"]) < tol))
         if cnt < best_cnt:
@@ -283,7 +285,7 @@ def _pick_anchor(entities, type_index, sizes):
     return best_idx
 
 
-# --- HTML 前端介面 ---
+# --- HTML frontend ---
 html_content = """
 <!DOCTYPE html>
 <html lang="en">
@@ -291,12 +293,12 @@ html_content = """
     <meta charset="UTF-8">
     <title>DXF CAD Pattern Scanner</title>
     <style>
-        body { font-family: sans-serif; padding: 20px; max-width: 1200px; margin: auto; }
+        body { font-family: sans-serif; padding: 20px; max-width: none; margin: 0; }
         .step-container { margin-bottom: 20px; padding: 15px; border: 1px solid #ddd; border-radius: 8px; background: #fafafa; }
-        #canvas-container { position: relative; display: inline-block; border: 1px solid #999; margin-top: 10px; cursor: crosshair; background: white; box-shadow: 0 4px 8px rgba(0,0,0,0.1); overflow: hidden; }
-        #transform-wrapper { transform-origin: 0 0; position: relative; }
-        #svg-display { max-width: 900px; display: block; }
-        #svg-display svg { width: 100%; height: auto; display: block; }
+        #canvas-container { position: relative; display: block; width: min(96vw, 1800px); height: clamp(640px, 80vh, 1200px); border: 1px solid #999; margin-top: 10px; cursor: crosshair; background: white; box-shadow: 0 4px 8px rgba(0,0,0,0.1); overflow: hidden; }
+        #transform-wrapper { transform-origin: 0 0; position: relative; width: 100%; height: 100%; }
+        #svg-display { width: 100%; height: 100%; display: block; }
+        #svg-display svg { width: 100%; height: 100%; display: block; }
         button { padding: 8px 16px; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 4px; }
         button:hover { background: #0056b3; }
         button:disabled { background: #ccc; cursor: not-allowed; }
@@ -325,6 +327,7 @@ html_content = """
                 <div id="svg-display"></div>
                 <svg id="svg-overlay" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:10;">
                     <g id="poly-group"></g>
+                    <g id="template-group"></g>
                     <g id="hl-group"></g>
                 </svg>
             </div>
@@ -350,6 +353,7 @@ html_content = """
         const svgDisplay = document.getElementById('svg-display');
         const svgOverlay = document.getElementById('svg-overlay');
         const polyG = document.getElementById('poly-group');
+        const tmplG = document.getElementById('template-group');
         const hlG   = document.getElementById('hl-group');
 
         // --- State ---
@@ -358,14 +362,66 @@ html_content = """
         let polyPts = [], polyClosed = false;
         let currentTemplate = null;
         let contentW = 0, contentH = 0;
+        let svgViewport = { x0: 0, y0: 0, w: 0, h: 0 };
 
         // --- Transform ---
         function applyTransform() {
             wrapper.style.transform = 'translate(' + panX + 'px,' + panY + 'px) scale(' + scale + ')';
         }
+        function syncCanvasSize() {
+            contentW = container.clientWidth;
+            contentH = container.clientHeight;
+            svgOverlay.setAttribute("viewBox", "0 0 " + contentW + " " + contentH);
+            svgViewport = getSvgViewport();
+        }
         function screenToContent(cx, cy) {
             var r = container.getBoundingClientRect();
             return { x: (cx - r.left - panX) / scale, y: (cy - r.top - panY) / scale };
+        }
+        function getSvgViewport() {
+            var fallback = { x0: 0, y0: 0, w: contentW, h: contentH };
+            var svgEl = svgDisplay.querySelector('svg');
+            if (!svgEl || !contentW || !contentH) return fallback;
+
+            var vb = svgEl.viewBox && svgEl.viewBox.baseVal;
+            if (!vb || !vb.width || !vb.height) return fallback;
+
+            var par = (svgEl.getAttribute('preserveAspectRatio') || 'xMidYMid meet').trim();
+            par = par.replace(/^defer\\s+/, '');
+            if (par === 'none') return fallback;
+
+            var parts = par.split(/\\s+/);
+            var align = parts[0] || 'xMidYMid';
+            var mode = parts[1] || 'meet';
+
+            var sx = contentW / vb.width;
+            var sy = contentH / vb.height;
+            var s = mode === 'slice' ? Math.max(sx, sy) : Math.min(sx, sy);
+            var vw = vb.width * s;
+            var vh = vb.height * s;
+
+            var ax = align.indexOf('xMin') === 0 ? 0 : (align.indexOf('xMax') === 0 ? 1 : 0.5);
+            var ay = align.indexOf('YMin') >= 0 ? 0 : (align.indexOf('YMax') >= 0 ? 1 : 0.5);
+
+            return {
+                x0: (contentW - vw) * ax,
+                y0: (contentH - vh) * ay,
+                w: vw,
+                h: vh,
+            };
+        }
+        function contentToSvgPct(p) {
+            if (!svgViewport.w || !svgViewport.h) return [0, 0];
+            return [
+                (p.x - svgViewport.x0) / svgViewport.w,
+                (p.y - svgViewport.y0) / svgViewport.h,
+            ];
+        }
+        function svgPctToContent(px, py) {
+            return {
+                x: svgViewport.x0 + px * svgViewport.w,
+                y: svgViewport.y0 + py * svgViewport.h,
+            };
         }
 
         // --- Upload ---
@@ -380,13 +436,15 @@ html_content = """
             if (data.svg) {
                 svgDisplay.innerHTML = data.svg;
                 requestAnimationFrame(function() {
-                    contentW = svgDisplay.offsetWidth;
-                    contentH = svgDisplay.offsetHeight;
-                    svgOverlay.setAttribute("viewBox", "0 0 " + contentW + " " + contentH);
+                    syncCanvasSize();
                     document.getElementById('extract-result').innerText = "Upload successful. Click to add vertices and select a feature.";
                 });
             }
         }
+        window.addEventListener('resize', function() {
+            if (!contentW || !contentH) return;
+            syncCanvasSize();
+        });
 
         // --- Pan (right / middle mouse) ---
         container.addEventListener('mousedown', function(e) {
@@ -489,7 +547,7 @@ html_content = """
         async function closePoly() {
             polyClosed = true;
             drawPoly(null);
-            var pct = polyPts.map(function(p){ return [p.x / contentW, p.y / contentH]; });
+            var pct = polyPts.map(function(p){ return contentToSvgPct(p); });
             document.getElementById('extract-result').innerText = "Extracting features...";
             var res = await fetch('/extract', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -499,15 +557,50 @@ html_content = """
             document.getElementById('extract-result').innerText = JSON.stringify(result, null, 2);
             if (result.entities && result.entities.length > 0) {
                 currentTemplate = result;
+                renderTemplateHighlights(result.highlights || []);
                 document.getElementById('btn-scan').disabled = false;
             } else {
+                tmplG.innerHTML = '';
                 document.getElementById('extract-result').innerText += "\\nNo valid entities found in selection.";
                 document.getElementById('btn-scan').disabled = true;
             }
         }
 
+        function renderTemplateHighlights(highlights) {
+            var NS = "http://www.w3.org/2000/svg";
+            var sw = 2 / scale;
+            tmplG.innerHTML = "";
+            highlights.forEach(function(h) {
+                if (h.kind === "circle") {
+                    var c = document.createElementNS(NS, "circle");
+                    var cc = svgPctToContent(h.cx_pct, h.cy_pct);
+                    c.setAttribute("cx", cc.x);
+                    c.setAttribute("cy", cc.y);
+                    c.setAttribute("r", Math.max(h.r_pct * svgViewport.w, 2 / scale));
+                    c.setAttribute("fill", "rgba(0, 200, 83, 0.12)");
+                    c.setAttribute("stroke", "#00c853");
+                    c.setAttribute("stroke-width", sw);
+                    tmplG.appendChild(c);
+                } else if (h.kind === "polyline") {
+                    for (var i = 0; i < h.points_pct.length - 1; i++) {
+                        var ln = document.createElementNS(NS, "line");
+                        var p1 = svgPctToContent(h.points_pct[i][0], h.points_pct[i][1]);
+                        var p2 = svgPctToContent(h.points_pct[i+1][0], h.points_pct[i+1][1]);
+                        ln.setAttribute("x1", p1.x);
+                        ln.setAttribute("y1", p1.y);
+                        ln.setAttribute("x2", p2.x);
+                        ln.setAttribute("y2", p2.y);
+                        ln.setAttribute("stroke", "#00c853");
+                        ln.setAttribute("stroke-width", sw);
+                        tmplG.appendChild(ln);
+                    }
+                }
+            });
+        }
+
         function clearPoly() {
             polyPts = []; polyClosed = false; polyG.innerHTML = '';
+            tmplG.innerHTML = '';
             currentTemplate = null;
             document.getElementById('btn-scan').disabled = true;
             document.getElementById('extract-result').innerText = "Cleared. Click to start a new selection.";
@@ -547,19 +640,22 @@ html_content = """
                 match.highlights.forEach(function(h) {
                     if (h.kind === "circle") {
                         var c = document.createElementNS(NS, "circle");
-                        c.setAttribute("cx", h.cx_pct * contentW);
-                        c.setAttribute("cy", h.cy_pct * contentH);
-                        c.setAttribute("r", Math.max(h.r_pct * contentW, 2 / scale));
+                        var cc = svgPctToContent(h.cx_pct, h.cy_pct);
+                        c.setAttribute("cx", cc.x);
+                        c.setAttribute("cy", cc.y);
+                        c.setAttribute("r", Math.max(h.r_pct * svgViewport.w, 2 / scale));
                         c.setAttribute("fill", "none");
                         c.setAttribute("stroke", "red"); c.setAttribute("stroke-width", sw);
                         hlG.appendChild(c);
                     } else if (h.kind === "polyline") {
                         for (var i = 0; i < h.points_pct.length - 1; i++) {
                             var ln = document.createElementNS(NS, "line");
-                            ln.setAttribute("x1", h.points_pct[i][0] * contentW);
-                            ln.setAttribute("y1", h.points_pct[i][1] * contentH);
-                            ln.setAttribute("x2", h.points_pct[i+1][0] * contentW);
-                            ln.setAttribute("y2", h.points_pct[i+1][1] * contentH);
+                            var p1 = svgPctToContent(h.points_pct[i][0], h.points_pct[i][1]);
+                            var p2 = svgPctToContent(h.points_pct[i+1][0], h.points_pct[i+1][1]);
+                            ln.setAttribute("x1", p1.x);
+                            ln.setAttribute("y1", p1.y);
+                            ln.setAttribute("x2", p2.x);
+                            ln.setAttribute("y2", p2.y);
                             ln.setAttribute("stroke", "red"); ln.setAttribute("stroke-width", sw);
                             hlG.appendChild(ln);
                         }
@@ -572,7 +668,7 @@ html_content = """
 </html>
 """
 
-# --- FastAPI 路由 ---
+# --- FastAPI routes ---
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -587,9 +683,12 @@ async def upload_dxf(file: UploadFile = File(...)):
     doc = ezdxf.readfile(TEMP_DXF_PATH)
     msp = doc.modelspace()
     backend = SVGBackend()
-    Frontend(RenderContext(doc), backend).draw_layout(msp)
+    render_config = Configuration.defaults().with_changes(
+        lineweight_scaling=SVG_LINEWEIGHT_SCALING
+    )
+    Frontend(RenderContext(doc), backend, config=render_config).draw_layout(msp)
     page = layout.Page(0, 0, layout.Units.mm)
-    # 一次性建立全域快取 (指紋 + KD-Tree + type index)
+    # Build global cache once (fingerprints + KD-Tree + type index)
     _build_cache(msp)
     return {"status": "success", "svg": backend.get_string(page)}
 
@@ -607,7 +706,7 @@ async def extract_template(data: dict = Body(...)):
 
     bounds = _cache["bounds"]
 
-    # 將百分比頂點轉換為 DXF 座標
+    # Convert percentage vertices to DXF coordinates
     dxf_vertices = [
         (
             bounds["min_x"] + pt[0] * bounds["width"],
@@ -617,7 +716,7 @@ async def extract_template(data: dict = Body(...)):
     ]
     roi_polygon = ShapelyPolygon(dxf_vertices)
 
-    # 直接從快取過濾，不再重新計算 linemerge
+    # Filter directly from cache (no linemerge recomputation)
     entities_found = [
         f
         for f in _cache["fingerprints"]
@@ -627,23 +726,25 @@ async def extract_template(data: dict = Body(...)):
     if not entities_found:
         return {"entities": []}
 
-    # 計算星系群組重心 (Group Centroid)
+    # Compute group centroid
     group_cx = sum(e["x"] for e in entities_found) / len(entities_found)
     group_cy = sum(e["y"] for e in entities_found) / len(entities_found)
 
-    # 移除 geometry 欄位，保持 template JSON 精簡
+    # Remove geometry field to keep template JSON compact
     entities_clean = [
         {k: v for k, v in e.items() if k != "geometry"} for e in entities_found
     ]
+    highlights = [geometry_to_render_pct(e["geometry"], bounds) for e in entities_found]
 
     return {
         "group_center": {"x": round(group_cx, 3), "y": round(group_cy, 3)},
         "entities": entities_clean,
+        "highlights": highlights,
     }
 
 
 def _build_match(anchor_idx_or_feat, anchor_tmpl, group_center, used, bounds, all_fp):
-    """共用的匹配結果建構函數。anchor 可傳 int(index) 或 dict(feature)。"""
+    """Shared match result builder. Anchor can be int(index) or dict(feature)."""
     if isinstance(anchor_idx_or_feat, (int, np.integer)):
         af = all_fp[int(anchor_idx_or_feat)]
     else:
@@ -675,7 +776,7 @@ def _build_match(anchor_idx_or_feat, anchor_tmpl, group_center, used, bounds, al
 
 @app.post("/scan")
 async def scan_dxf(template: dict = Body(...)):
-    """標準掃描 — cache + KD-Tree + bipartite matching (Python loop)"""
+    """Standard scan: cache + KD-Tree + bipartite matching (Python loop)."""
     if not _cache["ready"]:
         return JSONResponse(status_code=400, content={"error": "Please upload a file first"})
 
@@ -688,10 +789,27 @@ async def scan_dxf(template: dict = Body(...)):
     entities = template.get("entities", [])
     group_center = template.get("group_center", None)
 
-    if not entities or len(entities) < 2 or tree is None:
+    if not entities or tree is None:
         return {"match_count": 0, "matches": []}
 
-    # 選最稀有的實體當 anchor
+    # Single-entity template: search directly by type + size
+    if len(entities) == 1:
+        anchor_tmpl = entities[0]
+        group_center = template.get("group_center", None)
+        anchor_size_tol = max(SIZE_TOL_MIN, anchor_tmpl["size"] * SIZE_TOL_RATIO)
+
+        matches_found = [
+            _build_match(i, anchor_tmpl, group_center, set(), bounds, all_fp)
+            for i, f in enumerate(all_fp)
+            if f["type"] == anchor_tmpl["type"]
+            and abs(f["size"] - anchor_tmpl["size"]) < anchor_size_tol
+        ]
+        unique = list(
+            {(m["render_pct_x"], m["render_pct_y"]): m for m in matches_found}.values()
+        )
+        return {"match_count": len(unique), "matches": unique}
+
+    # Pick the rarest entity as anchor
     anchor_idx = _pick_anchor(entities, type_index, sizes)
     anchor_tmpl = entities[anchor_idx]
     others = [entities[i] for i in range(len(entities)) if i != anchor_idx]
@@ -727,7 +845,7 @@ async def scan_dxf(template: dict = Body(...)):
         cp = (ac["x"], ac["y"])
         local_set = set(tree.query_ball_point(cp, search_r)) - {ac_idx}
 
-        # 建 adjacency list
+        # Build adjacency list
         adj = []
         skip = False
         for t in targets:
@@ -763,7 +881,7 @@ async def scan_dxf(template: dict = Body(...)):
 
 @app.post("/scan_fast")
 async def scan_dxf_fast(template: dict = Body(...)):
-    """快速掃描 — cache + batch KD-Tree + numpy 向量化 + bipartite matching"""
+    """Fast scan: cache + batch KD-Tree + numpy vectorization + bipartite matching."""
     if not _cache["ready"]:
         return JSONResponse(status_code=400, content={"error": "Please upload a file first"})
 
@@ -777,10 +895,32 @@ async def scan_dxf_fast(template: dict = Body(...)):
     entities = template.get("entities", [])
     group_center = template.get("group_center", None)
 
-    if not entities or len(entities) < 2 or tree is None:
+    if not entities or tree is None:
         return {"match_count": 0, "matches": []}
 
-    # 選最稀有的實體當 anchor
+    # Single-entity template: search directly by type + size
+    if len(entities) == 1:
+        anchor_tmpl = entities[0]
+        group_center = template.get("group_center", None)
+        a_type = anchor_tmpl["type"]
+        if a_type not in type_index:
+            return {"match_count": 0, "matches": []}
+
+        anchor_size_tol = max(SIZE_TOL_MIN, anchor_tmpl["size"] * SIZE_TOL_RATIO)
+        a_idx = type_index[a_type]
+        mask = np.abs(sizes[a_idx] - anchor_tmpl["size"]) < anchor_size_tol
+        potential = a_idx[mask]
+
+        matches_found = [
+            _build_match(int(ai), anchor_tmpl, group_center, set(), bounds, all_fp)
+            for ai in potential
+        ]
+        unique = list(
+            {(m["render_pct_x"], m["render_pct_y"]): m for m in matches_found}.values()
+        )
+        return {"match_count": len(unique), "matches": unique}
+
+    # Pick the rarest entity as anchor
     anchor_idx = _pick_anchor(entities, type_index, sizes)
     anchor_tmpl = entities[anchor_idx]
     others = [entities[i] for i in range(len(entities)) if i != anchor_idx]
@@ -804,7 +944,7 @@ async def scan_dxf_fast(template: dict = Body(...)):
     max_tol = max(t["dist_tol"] for t in targets)
     search_r = max(t["dist"] for t in targets) + max_tol
 
-    # numpy 粗篩 anchor candidates
+    # Numpy pre-filter for anchor candidates
     a_type = anchor_tmpl["type"]
     if a_type not in type_index:
         return {"match_count": 0, "matches": []}
@@ -815,10 +955,10 @@ async def scan_dxf_fast(template: dict = Body(...)):
     if len(potential) == 0:
         return {"match_count": 0, "matches": []}
 
-    # batch KD-Tree query — 一次查完所有 anchor 的鄰居
+    # Batch KD-Tree query: fetch neighbors for all anchors in one call
     all_locals = tree.query_ball_point(coords[potential], search_r)
 
-    # 預建 type index arrays
+    # Prebuild type index arrays
     target_types = list(set(t["type"] for t in targets))
     type_idx_arrays = {t: type_index[t] for t in target_types if t in type_index}
 
@@ -830,10 +970,10 @@ async def scan_dxf_fast(template: dict = Body(...)):
         if len(local_arr) == 0:
             continue
 
-        # 排除 anchor 自己
+        # Exclude anchor itself
         local_arr = local_arr[local_arr != ai]
 
-        # 預交集：local ∩ type_index
+        # Pre-intersection: local intersection type_index
         local_by_type = {}
         for tt in target_types:
             if tt in type_idx_arrays:
@@ -841,7 +981,7 @@ async def scan_dxf_fast(template: dict = Body(...)):
             else:
                 local_by_type[tt] = np.array([], dtype=np.intp)
 
-        # 建 adjacency list (向量化 size + distance 篩選)
+        # Build adjacency list (vectorized size + distance filtering)
         adj = []
         skip = False
         for t in targets:
