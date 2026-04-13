@@ -713,6 +713,7 @@ html_content = """
             });
             var preview = {
                 match_count: data.match_count || matches.length,
+                scan_stats: data.scan_stats || null,
                 matches_preview: previewMatches,
             };
             var text = JSON.stringify(preview, null, 2);
@@ -1288,9 +1289,35 @@ def _trim_match_highlights(matches, max_with_highlights=MAX_SCAN_MATCHES_WITH_HI
     return matches
 
 
+def _finalize_scan_stats(stats, total_start):
+    stats["elapsed_ms"] = int((time.perf_counter() - total_start) * 1000)
+    scanned = stats.get("neighbor_sets_scanned", 0)
+    total_neighbors = stats.get("neighbor_features_total", 0)
+    stats["avg_neighbors_per_anchor"] = round(
+        (total_neighbors / scanned) if scanned else 0.0, 2
+    )
+    return stats
+
+
 @app.post("/scan")
 async def scan_dxf(template: dict = Body(...)):
     """Standard scan: cache + KD-Tree + bipartite matching (Python loop)."""
+    total_start = time.perf_counter()
+    stats = {
+        "engine": "standard",
+        "template_entity_count": 0,
+        "single_entity_mode": False,
+        "candidate_anchor_base": 0,
+        "candidate_anchor_after_plugin": 0,
+        "neighbor_sets_scanned": 0,
+        "neighbor_features_total": 0,
+        "adjacency_fail_count": 0,
+        "matching_fail_count": 0,
+        "raw_match_count": 0,
+        "unique_match_count": 0,
+        "prefilter_ms": 0,
+        "matching_ms": 0,
+    }
     cache_payload = _get_cache(template.get("cache_id"))
     if cache_payload is None:
         return JSONResponse(
@@ -1318,23 +1345,48 @@ async def scan_dxf(template: dict = Body(...)):
         entities = template.get("entities", [])
         group_center = template.get("group_center", None)
 
+    stats["template_entity_count"] = len(entities)
     if not entities or tree is None:
-        return {"match_count": 0, "matches": []}
+        return {
+            "match_count": 0,
+            "matches": [],
+            "scan_stats": _finalize_scan_stats(stats, total_start),
+        }
 
     # Single-entity template: search directly by type + size
     if len(entities) == 1:
+        stats["single_entity_mode"] = True
         anchor_tmpl = entities[0]
+        anchor_size_tol = max(SIZE_TOL_MIN, anchor_tmpl["size"] * SIZE_TOL_RATIO)
+        stats["candidate_anchor_base"] = sum(
+            1
+            for f in all_fp
+            if f["type"] == anchor_tmpl["type"]
+            and abs(f["size"] - anchor_tmpl["size"]) < anchor_size_tol
+        )
+        t_prefilter = time.perf_counter()
         matched_indices = _single_entity_matches(all_fp, anchor_tmpl)
+        stats["prefilter_ms"] = int((time.perf_counter() - t_prefilter) * 1000)
+        stats["candidate_anchor_after_plugin"] = len(matched_indices)
+        t_matching = time.perf_counter()
         matches_found = [
             _build_match(i, anchor_tmpl, group_center, set(), bounds, all_fp)
             for i in matched_indices
         ]
+        stats["matching_ms"] = int((time.perf_counter() - t_matching) * 1000)
+        stats["raw_match_count"] = len(matches_found)
         unique = list(
             {(m["render_pct_x"], m["render_pct_y"]): m for m in matches_found}.values()
         )
-        return {"match_count": len(unique), "matches": _trim_match_highlights(unique)}
+        stats["unique_match_count"] = len(unique)
+        return {
+            "match_count": len(unique),
+            "matches": _trim_match_highlights(unique),
+            "scan_stats": _finalize_scan_stats(stats, total_start),
+        }
 
     # Pick the rarest entity as anchor
+    t_prefilter = time.perf_counter()
     anchor_idx = _pick_anchor(entities, all_fp, type_index, sizes)
     anchor_tmpl = entities[anchor_idx]
     others = [entities[i] for i in range(len(entities)) if i != anchor_idx]
@@ -1365,14 +1417,20 @@ async def scan_dxf(template: dict = Body(...)):
         if f["type"] == anchor_tmpl["type"]
         and abs(f["size"] - anchor_tmpl["size"]) < anchor_size_tol
     ]
+    stats["candidate_anchor_base"] = len(potential_base)
     potential = [
         (i, f) for i, f in potential_base if _single_entity_plugin_pass(anchor_tmpl, f)
     ]
+    stats["candidate_anchor_after_plugin"] = len(potential)
+    stats["prefilter_ms"] = int((time.perf_counter() - t_prefilter) * 1000)
 
     matches_found = []
+    t_matching = time.perf_counter()
     for ac_idx, ac in potential:
         cp = (ac["x"], ac["y"])
         local_set = set(tree.query_ball_point(cp, search_r)) - {ac_idx}
+        stats["neighbor_sets_scanned"] += 1
+        stats["neighbor_features_total"] += len(local_set)
 
         # Build adjacency list
         adj = []
@@ -1392,6 +1450,7 @@ async def scan_dxf(template: dict = Body(...)):
             adj.append(valid)
 
         if skip:
+            stats["adjacency_fail_count"] += 1
             continue
 
         matched = _find_matching(adj)
@@ -1399,16 +1458,41 @@ async def scan_dxf(template: dict = Body(...)):
             matches_found.append(
                 _build_match(ac_idx, anchor_tmpl, group_center, matched, bounds, all_fp)
             )
+        else:
+            stats["matching_fail_count"] += 1
 
+    stats["matching_ms"] = int((time.perf_counter() - t_matching) * 1000)
+    stats["raw_match_count"] = len(matches_found)
     unique = list(
         {(m["render_pct_x"], m["render_pct_y"]): m for m in matches_found}.values()
     )
-    return {"match_count": len(unique), "matches": _trim_match_highlights(unique)}
+    stats["unique_match_count"] = len(unique)
+    return {
+        "match_count": len(unique),
+        "matches": _trim_match_highlights(unique),
+        "scan_stats": _finalize_scan_stats(stats, total_start),
+    }
 
 
 @app.post("/scan_fast")
 async def scan_dxf_fast(template: dict = Body(...)):
     """Fast scan: cache + batch KD-Tree + numpy vectorization + bipartite matching."""
+    total_start = time.perf_counter()
+    stats = {
+        "engine": "fast",
+        "template_entity_count": 0,
+        "single_entity_mode": False,
+        "candidate_anchor_base": 0,
+        "candidate_anchor_after_plugin": 0,
+        "neighbor_sets_scanned": 0,
+        "neighbor_features_total": 0,
+        "adjacency_fail_count": 0,
+        "matching_fail_count": 0,
+        "raw_match_count": 0,
+        "unique_match_count": 0,
+        "prefilter_ms": 0,
+        "matching_ms": 0,
+    }
     cache_payload = _get_cache(template.get("cache_id"))
     if cache_payload is None:
         return JSONResponse(
@@ -1437,23 +1521,49 @@ async def scan_dxf_fast(template: dict = Body(...)):
         entities = template.get("entities", [])
         group_center = template.get("group_center", None)
 
+    stats["template_entity_count"] = len(entities)
     if not entities or tree is None:
-        return {"match_count": 0, "matches": []}
+        return {
+            "match_count": 0,
+            "matches": [],
+            "scan_stats": _finalize_scan_stats(stats, total_start),
+        }
 
     # Single-entity template: search directly by type + size
     if len(entities) == 1:
+        stats["single_entity_mode"] = True
         anchor_tmpl = entities[0]
+        anchor_size_tol = max(SIZE_TOL_MIN, anchor_tmpl["size"] * SIZE_TOL_RATIO)
+        stats["candidate_anchor_base"] = sum(
+            1
+            for f in all_fp
+            if f["type"] == anchor_tmpl["type"]
+            and abs(f["size"] - anchor_tmpl["size"]) < anchor_size_tol
+        )
+        t_prefilter = time.perf_counter()
         matched_indices = _single_entity_matches(all_fp, anchor_tmpl)
+        stats["prefilter_ms"] = int((time.perf_counter() - t_prefilter) * 1000)
+        stats["candidate_anchor_after_plugin"] = len(matched_indices)
+
+        t_matching = time.perf_counter()
         matches_found = [
             _build_match(int(ai), anchor_tmpl, group_center, set(), bounds, all_fp)
             for ai in matched_indices
         ]
+        stats["matching_ms"] = int((time.perf_counter() - t_matching) * 1000)
+        stats["raw_match_count"] = len(matches_found)
         unique = list(
             {(m["render_pct_x"], m["render_pct_y"]): m for m in matches_found}.values()
         )
-        return {"match_count": len(unique), "matches": _trim_match_highlights(unique)}
+        stats["unique_match_count"] = len(unique)
+        return {
+            "match_count": len(unique),
+            "matches": _trim_match_highlights(unique),
+            "scan_stats": _finalize_scan_stats(stats, total_start),
+        }
 
     # Pick the rarest entity as anchor
+    t_prefilter = time.perf_counter()
     anchor_idx = _pick_anchor(entities, all_fp, type_index, sizes)
     anchor_tmpl = entities[anchor_idx]
     others = [entities[i] for i in range(len(entities)) if i != anchor_idx]
@@ -1481,10 +1591,16 @@ async def scan_dxf_fast(template: dict = Body(...)):
     # Numpy pre-filter for anchor candidates
     a_type = anchor_tmpl["type"]
     if a_type not in type_index:
-        return {"match_count": 0, "matches": []}
+        stats["prefilter_ms"] = int((time.perf_counter() - t_prefilter) * 1000)
+        return {
+            "match_count": 0,
+            "matches": [],
+            "scan_stats": _finalize_scan_stats(stats, total_start),
+        }
     a_idx = type_index[a_type]
     mask = np.abs(sizes[a_idx] - anchor_tmpl["size"]) < anchor_size_tol
     potential_base = a_idx[mask]
+    stats["candidate_anchor_base"] = int(len(potential_base))
     potential = potential_base
     potential = np.array(
         [
@@ -1494,9 +1610,15 @@ async def scan_dxf_fast(template: dict = Body(...)):
         ],
         dtype=np.intp,
     )
+    stats["candidate_anchor_after_plugin"] = int(len(potential))
+    stats["prefilter_ms"] = int((time.perf_counter() - t_prefilter) * 1000)
 
     if len(potential) == 0:
-        return {"match_count": 0, "matches": []}
+        return {
+            "match_count": 0,
+            "matches": [],
+            "scan_stats": _finalize_scan_stats(stats, total_start),
+        }
 
     # Batch KD-Tree query: fetch neighbors for all anchors in one call
     all_locals = tree.query_ball_point(coords[potential], search_r)
@@ -1506,6 +1628,7 @@ async def scan_dxf_fast(template: dict = Body(...)):
     type_idx_arrays = {t: type_index[t] for t in target_types if t in type_index}
 
     matches_found = []
+    t_matching = time.perf_counter()
 
     for pi, ai in enumerate(potential):
         cand = coords[ai]
@@ -1515,6 +1638,8 @@ async def scan_dxf_fast(template: dict = Body(...)):
 
         # Exclude anchor itself
         local_arr = local_arr[local_arr != ai]
+        stats["neighbor_sets_scanned"] += 1
+        stats["neighbor_features_total"] += int(len(local_arr))
 
         # Pre-intersection: local intersection type_index
         local_by_type = {}
@@ -1557,6 +1682,7 @@ async def scan_dxf_fast(template: dict = Body(...)):
             adj.append(valid.tolist())
 
         if skip:
+            stats["adjacency_fail_count"] += 1
             continue
 
         matched = _find_matching(adj)
@@ -1564,11 +1690,20 @@ async def scan_dxf_fast(template: dict = Body(...)):
             matches_found.append(
                 _build_match(int(ai), anchor_tmpl, group_center, matched, bounds, all_fp)
             )
+        else:
+            stats["matching_fail_count"] += 1
 
+    stats["matching_ms"] = int((time.perf_counter() - t_matching) * 1000)
+    stats["raw_match_count"] = len(matches_found)
     unique = list(
         {(m["render_pct_x"], m["render_pct_y"]): m for m in matches_found}.values()
     )
-    return {"match_count": len(unique), "matches": _trim_match_highlights(unique)}
+    stats["unique_match_count"] = len(unique)
+    return {
+        "match_count": len(unique),
+        "matches": _trim_match_highlights(unique),
+        "scan_stats": _finalize_scan_stats(stats, total_start),
+    }
 
 
 if __name__ == "__main__":
