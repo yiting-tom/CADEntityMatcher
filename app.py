@@ -7,6 +7,7 @@ import uuid
 from typing import Callable
 import numpy as np
 from scipy.spatial import cKDTree
+from scipy.optimize import linear_sum_assignment
 from fastapi import FastAPI, UploadFile, File, Body, Form
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
@@ -41,6 +42,11 @@ MAX_EXTRACT_ENTITIES_PREVIEW = 80
 MAX_TEMPLATES_PER_CACHE = 16
 MAX_SCAN_HIGHLIGHTS_RETURN = 80
 MAX_SCAN_MATCHES_WITH_HIGHLIGHTS = 120
+MATCH_SCORE_MAX_DEFAULT = 0.40
+MATCH_SCORE_ANCHOR_WEIGHT = 0.30
+MATCH_SCORE_SIZE_WEIGHT = 0.45
+MATCH_SCORE_DIST_WEIGHT = 0.45
+MATCH_SCORE_SHAPE_WEIGHT = 0.10
 
 
 def snap(val):
@@ -479,6 +485,73 @@ def _single_entity_plugin_pass(template_entity, candidate_feature):
     return True
 
 
+def _clamp01(v):
+    return max(0.0, min(1.0, float(v)))
+
+
+def _shape_signature_error(template_entity, candidate_feature):
+    """Normalized shape signature error (0..1), only for COMPOSITE_SHAPE."""
+    if template_entity.get("type") != "COMPOSITE_SHAPE":
+        return 0.0
+    ts = template_entity.get("shape_sig")
+    cs = candidate_feature.get("shape_sig")
+    if not isinstance(ts, dict) or not isinstance(cs, dict):
+        return 0.0
+
+    parts = []
+
+    tp = ts.get("point_count")
+    cp = cs.get("point_count")
+    if isinstance(tp, (int, float)) and isinstance(cp, (int, float)):
+        parts.append(_clamp01(abs(int(tp) - int(cp)) / max(1, SINGLE_POINT_COUNT_TOL)))
+
+    ta = ts.get("aspect_ratio")
+    ca = cs.get("aspect_ratio")
+    if isinstance(ta, (int, float)) and isinstance(ca, (int, float)) and ta > 0:
+        rel = abs(ca - ta) / ta
+        parts.append(_clamp01(rel / SINGLE_ASPECT_RATIO_TOL))
+
+    td = ts.get("bbox_diag")
+    cd = cs.get("bbox_diag")
+    if isinstance(td, (int, float)) and isinstance(cd, (int, float)) and td > 0:
+        rel = abs(cd - td) / td
+        parts.append(_clamp01(rel / SINGLE_DIAG_TOL))
+
+    if not parts:
+        return 0.0
+    return float(sum(parts) / len(parts))
+
+
+def _pair_match_score(
+    template_entity,
+    candidate_feature,
+    *,
+    size_tol,
+    dist_error_ratio=None,
+):
+    """Compute normalized pair match score (lower is better)."""
+    size_err = _clamp01(abs(candidate_feature["size"] - template_entity["size"]) / size_tol)
+    shape_err = _shape_signature_error(template_entity, candidate_feature)
+    if dist_error_ratio is None:
+        return round(0.85 * size_err + 0.15 * shape_err, 6)
+    dist_err = _clamp01(dist_error_ratio)
+    return round(
+        MATCH_SCORE_SIZE_WEIGHT * size_err
+        + MATCH_SCORE_DIST_WEIGHT * dist_err
+        + MATCH_SCORE_SHAPE_WEIGHT * shape_err,
+        6,
+    )
+
+
+def _resolve_score_max(template):
+    raw = template.get("score_max", MATCH_SCORE_MAX_DEFAULT)
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return MATCH_SCORE_MAX_DEFAULT
+    return _clamp01(v)
+
+
 def _entity_basic_match(template_entity, candidate_feature, size_tol=None):
     """Base entity matching: type + size (+ optional shape plugins)."""
     if candidate_feature.get("type") != template_entity.get("type"):
@@ -500,6 +573,36 @@ def _single_entity_matches(all_fp, anchor_tmpl):
         for i, f in enumerate(all_fp)
         if _entity_basic_match(anchor_tmpl, f)
     ]
+
+
+def _best_scored_matching(adj_scored):
+    """Solve min-cost one-to-one matching from scored adjacency lists."""
+    n = len(adj_scored)
+    if n == 0:
+        return set(), 0.0
+
+    right_nodes = sorted({idx for row in adj_scored for idx, _ in row})
+    if len(right_nodes) < n:
+        return None
+
+    jmap = {rid: j for j, rid in enumerate(right_nodes)}
+    inf_cost = 1e6
+    cost = np.full((n, len(right_nodes)), inf_cost, dtype=np.float64)
+    for i, row in enumerate(adj_scored):
+        for rid, s in row:
+            j = jmap[rid]
+            if s < cost[i, j]:
+                cost[i, j] = s
+
+    row_ind, col_ind = linear_sum_assignment(cost)
+    if len(row_ind) != n:
+        return None
+    selected = cost[row_ind, col_ind]
+    if np.any(selected >= inf_cost):
+        return None
+
+    matched = {right_nodes[int(j)] for j in col_ind}
+    return matched, float(np.mean(selected))
 
 
 register_single_entity_plugin(_plugin_composite_shape_signature)
@@ -707,6 +810,7 @@ html_content = """
                     dxf_y: m.dxf_y,
                     render_pct_x: m.render_pct_x,
                     render_pct_y: m.render_pct_y,
+                    match_score: m.match_score,
                     highlight_count_total: m.highlight_count_total ?? (m.highlights ? m.highlights.length : 0),
                     highlight_count_returned: m.highlight_count_returned ?? (m.highlights ? m.highlights.length : 0),
                 };
@@ -1022,6 +1126,10 @@ html_content = """
                 document.getElementById('scan-status').innerText +=
                     ' | Server highlight payload capped for ' + noHighlightMatches + ' matches';
             }
+            if (data.scan_stats && data.scan_stats.score_max !== undefined) {
+                document.getElementById('scan-status').innerText +=
+                    ' | score_max=' + data.scan_stats.score_max;
+            }
             setScanPreview(data);
             renderHighlights(data.matches);
             currentMatchResult = data;
@@ -1243,6 +1351,7 @@ def _build_match(
     all_fp,
     *,
     max_highlights=MAX_SCAN_HIGHLIGHTS_RETURN,
+    match_score=None,
 ):
     """Shared match result builder. Anchor can be int(index) or dict(feature)."""
     if isinstance(anchor_idx_or_feat, (int, np.integer)):
@@ -1271,6 +1380,7 @@ def _build_match(
         "dxf_y": round(mcy, 3),
         "render_pct_x": round(rpx, 4),
         "render_pct_y": round(rpy, 4),
+        "match_score": (round(float(match_score), 6) if match_score is not None else None),
         "highlights": hl,
         "highlight_count_total": len(mf),
         "highlight_count_returned": len(hl),
@@ -1287,6 +1397,21 @@ def _trim_match_highlights(matches, max_with_highlights=MAX_SCAN_MATCHES_WITH_HI
         m["highlight_count_returned"] = 0
         m["highlight_truncated"] = m.get("highlight_count_total", 0) > 0
     return matches
+
+
+def _dedupe_and_sort_matches(matches):
+    """Deduplicate by rendered center; keep the lowest score, then sort by score."""
+    best = {}
+    for m in matches:
+        k = (m["render_pct_x"], m["render_pct_y"])
+        prev = best.get(k)
+        ms = m.get("match_score")
+        ps = None if prev is None else prev.get("match_score")
+        if prev is None or (ms is not None and (ps is None or ms < ps)):
+            best[k] = m
+    out = list(best.values())
+    out.sort(key=lambda m: (m.get("match_score") is None, m.get("match_score", 1e9)))
+    return out
 
 
 def _finalize_scan_stats(stats, total_start):
@@ -1307,6 +1432,8 @@ async def scan_dxf(template: dict = Body(...)):
         "engine": "standard",
         "template_entity_count": 0,
         "single_entity_mode": False,
+        "score_max": None,
+        "score_reject_count": 0,
         "candidate_anchor_base": 0,
         "candidate_anchor_after_plugin": 0,
         "neighbor_sets_scanned": 0,
@@ -1345,6 +1472,8 @@ async def scan_dxf(template: dict = Body(...)):
         entities = template.get("entities", [])
         group_center = template.get("group_center", None)
 
+    score_max = _resolve_score_max(template)
+    stats["score_max"] = score_max
     stats["template_entity_count"] = len(entities)
     if not entities or tree is None:
         return {
@@ -1369,15 +1498,27 @@ async def scan_dxf(template: dict = Body(...)):
         stats["prefilter_ms"] = int((time.perf_counter() - t_prefilter) * 1000)
         stats["candidate_anchor_after_plugin"] = len(matched_indices)
         t_matching = time.perf_counter()
-        matches_found = [
-            _build_match(i, anchor_tmpl, group_center, set(), bounds, all_fp)
-            for i in matched_indices
-        ]
+        matches_found = []
+        for i in matched_indices:
+            f = all_fp[i]
+            s = _pair_match_score(anchor_tmpl, f, size_tol=anchor_size_tol)
+            if s > score_max:
+                stats["score_reject_count"] += 1
+                continue
+            matches_found.append(
+                _build_match(
+                    i,
+                    anchor_tmpl,
+                    group_center,
+                    set(),
+                    bounds,
+                    all_fp,
+                    match_score=s,
+                )
+            )
         stats["matching_ms"] = int((time.perf_counter() - t_matching) * 1000)
         stats["raw_match_count"] = len(matches_found)
-        unique = list(
-            {(m["render_pct_x"], m["render_pct_y"]): m for m in matches_found}.values()
-        )
+        unique = _dedupe_and_sort_matches(matches_found)
         stats["unique_match_count"] = len(unique)
         return {
             "match_count": len(unique),
@@ -1432,8 +1573,8 @@ async def scan_dxf(template: dict = Body(...)):
         stats["neighbor_sets_scanned"] += 1
         stats["neighbor_features_total"] += len(local_set)
 
-        # Build adjacency list
-        adj = []
+        # Build scored adjacency list
+        adj_scored = []
         skip = False
         for t in targets:
             valid = []
@@ -1442,30 +1583,54 @@ async def scan_dxf(template: dict = Body(...)):
                 if not _entity_basic_match(t["entity"], f, size_tol=t["size_tol"]):
                     continue
                 d = calculate_distance(cp, (f["x"], f["y"]))
-                if abs(d - t["dist"]) < t["dist_tol"]:
-                    valid.append(idx)
+                dist_err = abs(d - t["dist"])
+                if dist_err < t["dist_tol"]:
+                    edge_score = _pair_match_score(
+                        t["entity"],
+                        f,
+                        size_tol=t["size_tol"],
+                        dist_error_ratio=(dist_err / t["dist_tol"]),
+                    )
+                    valid.append((idx, edge_score))
             if not valid:
                 skip = True
                 break
-            adj.append(valid)
+            adj_scored.append(valid)
 
         if skip:
             stats["adjacency_fail_count"] += 1
             continue
 
-        matched = _find_matching(adj)
+        matched = _best_scored_matching(adj_scored)
         if matched is not None:
+            matched_set, edge_mean_score = matched
+            anchor_score = _pair_match_score(
+                anchor_tmpl, ac, size_tol=anchor_size_tol
+            )
+            total_score = (
+                MATCH_SCORE_ANCHOR_WEIGHT * anchor_score
+                + (1.0 - MATCH_SCORE_ANCHOR_WEIGHT) * edge_mean_score
+            )
+            if total_score > score_max:
+                stats["score_reject_count"] += 1
+                continue
             matches_found.append(
-                _build_match(ac_idx, anchor_tmpl, group_center, matched, bounds, all_fp)
+                _build_match(
+                    ac_idx,
+                    anchor_tmpl,
+                    group_center,
+                    matched_set,
+                    bounds,
+                    all_fp,
+                    match_score=total_score,
+                )
             )
         else:
             stats["matching_fail_count"] += 1
 
     stats["matching_ms"] = int((time.perf_counter() - t_matching) * 1000)
     stats["raw_match_count"] = len(matches_found)
-    unique = list(
-        {(m["render_pct_x"], m["render_pct_y"]): m for m in matches_found}.values()
-    )
+    unique = _dedupe_and_sort_matches(matches_found)
     stats["unique_match_count"] = len(unique)
     return {
         "match_count": len(unique),
@@ -1482,6 +1647,8 @@ async def scan_dxf_fast(template: dict = Body(...)):
         "engine": "fast",
         "template_entity_count": 0,
         "single_entity_mode": False,
+        "score_max": None,
+        "score_reject_count": 0,
         "candidate_anchor_base": 0,
         "candidate_anchor_after_plugin": 0,
         "neighbor_sets_scanned": 0,
@@ -1521,6 +1688,8 @@ async def scan_dxf_fast(template: dict = Body(...)):
         entities = template.get("entities", [])
         group_center = template.get("group_center", None)
 
+    score_max = _resolve_score_max(template)
+    stats["score_max"] = score_max
     stats["template_entity_count"] = len(entities)
     if not entities or tree is None:
         return {
@@ -1546,15 +1715,27 @@ async def scan_dxf_fast(template: dict = Body(...)):
         stats["candidate_anchor_after_plugin"] = len(matched_indices)
 
         t_matching = time.perf_counter()
-        matches_found = [
-            _build_match(int(ai), anchor_tmpl, group_center, set(), bounds, all_fp)
-            for ai in matched_indices
-        ]
+        matches_found = []
+        for ai in matched_indices:
+            f = all_fp[int(ai)]
+            s = _pair_match_score(anchor_tmpl, f, size_tol=anchor_size_tol)
+            if s > score_max:
+                stats["score_reject_count"] += 1
+                continue
+            matches_found.append(
+                _build_match(
+                    int(ai),
+                    anchor_tmpl,
+                    group_center,
+                    set(),
+                    bounds,
+                    all_fp,
+                    match_score=s,
+                )
+            )
         stats["matching_ms"] = int((time.perf_counter() - t_matching) * 1000)
         stats["raw_match_count"] = len(matches_found)
-        unique = list(
-            {(m["render_pct_x"], m["render_pct_y"]): m for m in matches_found}.values()
-        )
+        unique = _dedupe_and_sort_matches(matches_found)
         stats["unique_match_count"] = len(unique)
         return {
             "match_count": len(unique),
@@ -1649,8 +1830,8 @@ async def scan_dxf_fast(template: dict = Body(...)):
             else:
                 local_by_type[tt] = np.array([], dtype=np.intp)
 
-        # Build adjacency list (vectorized size + distance filtering)
-        adj = []
+        # Build scored adjacency list (vectorized size + distance filtering)
+        adj_scored = []
         skip = False
         for t in targets:
             cands = local_by_type.get(t["type"], np.array([], dtype=np.intp))
@@ -1674,30 +1855,58 @@ async def scan_dxf_fast(template: dict = Body(...)):
                 skip = True
                 break
             dists = np.linalg.norm(coords[cands] - cand, axis=1)
-            d_mask = np.abs(dists - t["dist"]) < t["dist_tol"]
+            dist_err = np.abs(dists - t["dist"])
+            d_mask = dist_err < t["dist_tol"]
             valid = cands[d_mask]
             if len(valid) == 0:
                 skip = True
                 break
-            adj.append(valid.tolist())
+            valid_dist_err = dist_err[d_mask]
+            scored = []
+            for vi, de in zip(valid.tolist(), valid_dist_err.tolist()):
+                edge_score = _pair_match_score(
+                    t["entity"],
+                    all_fp[int(vi)],
+                    size_tol=t["size_tol"],
+                    dist_error_ratio=(de / t["dist_tol"]),
+                )
+                scored.append((int(vi), edge_score))
+            adj_scored.append(scored)
 
         if skip:
             stats["adjacency_fail_count"] += 1
             continue
 
-        matched = _find_matching(adj)
+        matched = _best_scored_matching(adj_scored)
         if matched is not None:
+            matched_set, edge_mean_score = matched
+            anchor_score = _pair_match_score(
+                anchor_tmpl, all_fp[int(ai)], size_tol=anchor_size_tol
+            )
+            total_score = (
+                MATCH_SCORE_ANCHOR_WEIGHT * anchor_score
+                + (1.0 - MATCH_SCORE_ANCHOR_WEIGHT) * edge_mean_score
+            )
+            if total_score > score_max:
+                stats["score_reject_count"] += 1
+                continue
             matches_found.append(
-                _build_match(int(ai), anchor_tmpl, group_center, matched, bounds, all_fp)
+                _build_match(
+                    int(ai),
+                    anchor_tmpl,
+                    group_center,
+                    matched_set,
+                    bounds,
+                    all_fp,
+                    match_score=total_score,
+                )
             )
         else:
             stats["matching_fail_count"] += 1
 
     stats["matching_ms"] = int((time.perf_counter() - t_matching) * 1000)
     stats["raw_match_count"] = len(matches_found)
-    unique = list(
-        {(m["render_pct_x"], m["render_pct_y"]): m for m in matches_found}.values()
-    )
+    unique = _dedupe_and_sort_matches(matches_found)
     stats["unique_match_count"] = len(unique)
     return {
         "match_count": len(unique),
