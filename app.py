@@ -1,9 +1,13 @@
-import os
 import math
-import itertools
+import os
+import tempfile
+import threading
+import time
+import uuid
+from typing import Callable
 import numpy as np
 from scipy.spatial import cKDTree
-from fastapi import FastAPI, UploadFile, File, Body
+from fastapi import FastAPI, UploadFile, File, Body, Form
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 import ezdxf
@@ -17,9 +21,6 @@ from shapely.ops import linemerge
 # Initialize FastAPI app
 app = FastAPI()
 
-# Temporary upload path
-TEMP_DXF_PATH = "temp_uploaded.dxf"
-
 # --- Algorithm constants ---
 SNAP_DECIMALS = 6  # Endpoint rounding precision for stable linemerge stitching
 SIZE_TOL_RATIO = 0.05  # Relative size tolerance ratio (5%)
@@ -27,6 +28,19 @@ SIZE_TOL_MIN = 0.05  # Minimum absolute size tolerance
 DIST_TOL_RATIO = 0.05  # Relative distance tolerance ratio (5%)
 DIST_TOL_MIN = 0.1  # Minimum absolute distance tolerance
 SVG_LINEWEIGHT_SCALING = 0.2  # Make preview SVG strokes thinner
+CACHE_TTL_SECONDS = 60 * 60  # 1 hour
+MAX_CACHE_SESSIONS = 32
+SINGLE_POINT_COUNT_TOL = 2
+SINGLE_ASPECT_RATIO_TOL = 0.20  # 20%
+SINGLE_DIAG_TOL = 0.10  # 10%
+DEFAULT_FLATTEN_TOL = 0.01
+FAST_FLATTEN_TOL = 0.08
+MAX_EXTRACT_HIGHLIGHTS_RETURN = 250
+MAX_HIGHLIGHT_POINTS_RETURN = 400
+MAX_EXTRACT_ENTITIES_PREVIEW = 80
+MAX_TEMPLATES_PER_CACHE = 16
+MAX_SCAN_HIGHLIGHTS_RETURN = 80
+MAX_SCAN_MATCHES_WITH_HIGHLIGHTS = 120
 
 
 def snap(val):
@@ -72,6 +86,25 @@ def geometry_to_render_pct(geom, bounds):
         }
 
 
+def _sample_points(points, max_points):
+    if len(points) <= max_points:
+        return points
+    step = max(1, math.ceil(len(points) / max_points))
+    sampled = points[::step]
+    if sampled[-1] != points[-1]:
+        sampled.append(points[-1])
+    return sampled
+
+
+def _compact_render_highlight(h):
+    if h.get("kind") != "polyline":
+        return h
+    points = h.get("points_pct", [])
+    compact = dict(h)
+    compact["points_pct"] = _sample_points(points, MAX_HIGHLIGHT_POINTS_RETURN)
+    return compact
+
+
 def get_dxf_bounds(msp):
     """Get DXF extents and dimensions."""
     ext = extents(msp)
@@ -85,7 +118,26 @@ def get_dxf_bounds(msp):
     }
 
 
-def extract_template_features(msp, roi_box=None):
+def _polyline_shape_signature(points):
+    """Build an orientation-agnostic shape signature for polyline matching."""
+    if not points:
+        return {"point_count": 0, "bbox_diag": 0.0, "aspect_ratio": 1.0}
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    w = max(xs) - min(xs)
+    h = max(ys) - min(ys)
+    long_side = max(w, h)
+    short_side = max(min(w, h), 1e-9)
+    return {
+        "point_count": int(len(points)),
+        "bbox_diag": round(math.hypot(w, h), 6),
+        "aspect_ratio": round(long_side / short_side, 6),
+    }
+
+
+def extract_template_features(
+    msp, roi_box=None, *, flatten_tol=DEFAULT_FLATTEN_TOL, skip_ellipse_spline=False
+):
     """
     Smart feature extraction v2:
     1. Always run global linemerge on the whole drawing for topology consistency.
@@ -162,9 +214,11 @@ def extract_template_features(msp, roi_box=None):
                 pass
 
         elif etype in ("ELLIPSE", "SPLINE"):
+            if skip_ellipse_spline:
+                continue
             try:
                 pts = [
-                    (snap(p.x), snap(p.y)) for p in entity.flattening(0.01)
+                    (snap(p.x), snap(p.y)) for p in entity.flattening(flatten_tol)
                 ]
                 if len(pts) >= 2:
                     all_lines.append(LineString(pts))
@@ -189,6 +243,7 @@ def extract_template_features(msp, roi_box=None):
                     "size": round(geom.length, 3),
                     "x": round(centroid.x, 3),
                     "y": round(centroid.y, 3),
+                    "shape_sig": _polyline_shape_signature(list(geom.coords)),
                     "geometry": {
                         "kind": "polyline",
                         "points": [list(c) for c in geom.coords],
@@ -198,21 +253,26 @@ def extract_template_features(msp, roi_box=None):
 
     # --- ROI filtering: keep features whose centroids are inside ROI ---
     if roi_box is not None:
-        features = [
-            f for f in features if roi_box.contains(Point(f["x"], f["y"]))
-        ]
+        features = [f for f in features if roi_box.covers(Point(f["x"], f["y"]))]
 
     return features
 
 
-# --- Global cache (computed once after upload) ---
-_cache = {"ready": False}
+# --- Session cache store ---
+_cache_store = {}
+_cache_lock = threading.Lock()
 
 
-def _build_cache(msp):
-    """Compute and cache all fingerprints and spatial indexes once after upload."""
+def _build_cache_payload(msp, *, fast_build=False):
+    """Build cache payload (fingerprints + spatial indexes) for one upload."""
     bounds = get_dxf_bounds(msp)
-    fingerprints = extract_template_features(msp, roi_box=None)
+    flatten_tol = FAST_FLATTEN_TOL if fast_build else DEFAULT_FLATTEN_TOL
+    fingerprints = extract_template_features(
+        msp,
+        roi_box=None,
+        flatten_tol=flatten_tol,
+        skip_ellipse_spline=fast_build,
+    )
 
     n = len(fingerprints)
     if n > 0:
@@ -230,17 +290,102 @@ def _build_cache(msp):
         type_index.setdefault(f["type"], []).append(idx)
     type_index = {t: np.array(v) for t, v in type_index.items()}
 
-    _cache.update(
-        {
-            "ready": True,
-            "bounds": bounds,
-            "fingerprints": fingerprints,
-            "coords": coords,
-            "sizes": sizes,
-            "tree": tree,
-            "type_index": type_index,
+    now = time.time()
+    return {
+        "bounds": bounds,
+        "fingerprints": fingerprints,
+        "coords": coords,
+        "sizes": sizes,
+        "tree": tree,
+        "type_index": type_index,
+        "templates": {},
+        "fast_build": fast_build,
+        "flatten_tol": flatten_tol,
+        "created_at": now,
+        "last_access": now,
+    }
+
+
+def _prune_cache_locked(now):
+    expired = [
+        cid
+        for cid, payload in _cache_store.items()
+        if now - payload["last_access"] > CACHE_TTL_SECONDS
+    ]
+    for cid in expired:
+        _cache_store.pop(cid, None)
+
+    if len(_cache_store) <= MAX_CACHE_SESSIONS:
+        return
+
+    overflow = len(_cache_store) - MAX_CACHE_SESSIONS
+    oldest = sorted(_cache_store.items(), key=lambda item: item[1]["last_access"])
+    for cid, _ in oldest[:overflow]:
+        _cache_store.pop(cid, None)
+
+
+def _store_cache(cache_payload):
+    """Store cache payload and return its cache_id."""
+    cache_id = uuid.uuid4().hex
+    now = time.time()
+    with _cache_lock:
+        cache_payload["last_access"] = now
+        _cache_store[cache_id] = cache_payload
+        _prune_cache_locked(now)
+    return cache_id
+
+
+def _get_cache(cache_id):
+    """Fetch cache payload by id, update access timestamp, return None if missing."""
+    if not cache_id:
+        return None
+    now = time.time()
+    with _cache_lock:
+        _prune_cache_locked(now)
+        payload = _cache_store.get(cache_id)
+        if payload is not None:
+            payload["last_access"] = now
+        return payload
+
+
+def _store_extracted_template(cache_id, group_center, entities):
+    """Store extracted template server-side and return template_id."""
+    if not cache_id:
+        return None
+    now = time.time()
+    with _cache_lock:
+        payload = _cache_store.get(cache_id)
+        if payload is None:
+            return None
+        templates = payload.setdefault("templates", {})
+        template_id = uuid.uuid4().hex
+        templates[template_id] = {
+            "group_center": group_center,
+            "entities": entities,
+            "created_at": now,
         }
-    )
+        # Keep only most recent templates to bound memory.
+        if len(templates) > MAX_TEMPLATES_PER_CACHE:
+            oldest = sorted(
+                templates.items(), key=lambda item: item[1].get("created_at", 0)
+            )
+            for tid, _ in oldest[: len(templates) - MAX_TEMPLATES_PER_CACHE]:
+                templates.pop(tid, None)
+        payload["last_access"] = now
+        return template_id
+
+
+def _load_extracted_template(cache_id, template_id):
+    """Load extracted template from cache by ids."""
+    if not cache_id or not template_id:
+        return None
+    now = time.time()
+    with _cache_lock:
+        payload = _cache_store.get(cache_id)
+        if payload is None:
+            return None
+        payload["last_access"] = now
+        return payload.get("templates", {}).get(template_id)
 
 
 def _find_matching(adj):
@@ -270,7 +415,7 @@ def _find_matching(adj):
     return set(match_r.keys())
 
 
-def _pick_anchor(entities, type_index, sizes):
+def _pick_anchor(entities, all_fp, type_index, sizes):
     """Pick the entity with the fewest global candidates as anchor (rarest first)."""
     best_idx, best_cnt = 0, float("inf")
     for i, e in enumerate(entities):
@@ -278,11 +423,86 @@ def _pick_anchor(entities, type_index, sizes):
         if t not in type_index:
             return i  # Type not found globally -> 0 candidates; fast fail
         tol = max(SIZE_TOL_MIN, e["size"] * SIZE_TOL_RATIO)
-        cnt = int(np.sum(np.abs(sizes[type_index[t]] - e["size"]) < tol))
+        base_idx = type_index[t][np.abs(sizes[type_index[t]] - e["size"]) < tol]
+        if len(base_idx) == 0:
+            return i
+        cnt = sum(1 for idx in base_idx if _single_entity_plugin_pass(e, all_fp[int(idx)]))
         if cnt < best_cnt:
             best_cnt = cnt
             best_idx = i
     return best_idx
+
+
+SingleEntityPlugin = Callable[[dict, dict], bool]
+SINGLE_ENTITY_MATCH_PLUGINS: list[SingleEntityPlugin] = []
+
+
+def register_single_entity_plugin(plugin: SingleEntityPlugin):
+    """Register a single-entity matching plugin."""
+    if plugin not in SINGLE_ENTITY_MATCH_PLUGINS:
+        SINGLE_ENTITY_MATCH_PLUGINS.append(plugin)
+
+
+def _plugin_composite_shape_signature(template_entity, candidate_feature):
+    """Filter COMPOSITE_SHAPE candidates using extra shape signature fields."""
+    if template_entity.get("type") != "COMPOSITE_SHAPE":
+        return True
+    ts = template_entity.get("shape_sig")
+    cs = candidate_feature.get("shape_sig")
+    if not isinstance(ts, dict) or not isinstance(cs, dict):
+        return True
+
+    tp = ts.get("point_count")
+    cp = cs.get("point_count")
+    if isinstance(tp, (int, float)) and isinstance(cp, (int, float)):
+        if abs(int(tp) - int(cp)) > SINGLE_POINT_COUNT_TOL:
+            return False
+
+    ta = ts.get("aspect_ratio")
+    ca = cs.get("aspect_ratio")
+    if isinstance(ta, (int, float)) and isinstance(ca, (int, float)) and ta > 0:
+        if abs(ca - ta) / ta > SINGLE_ASPECT_RATIO_TOL:
+            return False
+
+    td = ts.get("bbox_diag")
+    cd = cs.get("bbox_diag")
+    if isinstance(td, (int, float)) and isinstance(cd, (int, float)) and td > 0:
+        if abs(cd - td) / td > SINGLE_DIAG_TOL:
+            return False
+    return True
+
+
+def _single_entity_plugin_pass(template_entity, candidate_feature):
+    for plugin in SINGLE_ENTITY_MATCH_PLUGINS:
+        if not plugin(template_entity, candidate_feature):
+            return False
+    return True
+
+
+def _entity_basic_match(template_entity, candidate_feature, size_tol=None):
+    """Base entity matching: type + size (+ optional shape plugins)."""
+    if candidate_feature.get("type") != template_entity.get("type"):
+        return False
+    tol = (
+        size_tol
+        if size_tol is not None
+        else max(SIZE_TOL_MIN, template_entity["size"] * SIZE_TOL_RATIO)
+    )
+    if abs(candidate_feature.get("size", 0.0) - template_entity["size"]) >= tol:
+        return False
+    return _single_entity_plugin_pass(template_entity, candidate_feature)
+
+
+def _single_entity_matches(all_fp, anchor_tmpl):
+    """Find single-entity matches by base filters + pluggable plugin filters."""
+    return [
+        i
+        for i, f in enumerate(all_fp)
+        if _entity_basic_match(anchor_tmpl, f)
+    ]
+
+
+register_single_entity_plugin(_plugin_composite_shape_signature)
 
 
 # --- HTML frontend ---
@@ -314,7 +534,12 @@ html_content = """
     <div class="step-container">
         <h3>Step 1: Upload DXF File</h3>
         <input type="file" id="dxf-file" accept=".dxf">
+        <label style="margin-left:10px;">
+            <input type="checkbox" id="fast-cache-build"> Fast Cache Build (skip ELLIPSE/SPLINE)
+        </label>
         <button onclick="uploadDXF()">Upload &amp; Render SVG</button>
+        <h4>Upload Stats:</h4>
+        <pre id="upload-result">No upload yet</pre>
     </div>
 
     <div class="step-container">
@@ -333,6 +558,7 @@ html_content = """
             </div>
         </div>
         <h4>Extracted Template Fingerprint:</h4>
+        <button id="btn-download-template" class="btn-sm" onclick="downloadTemplateFingerprint()" disabled>Download Fingerprint</button>
         <pre id="extract-result">No data yet</pre>
     </div>
 
@@ -342,6 +568,7 @@ html_content = """
         <label style="margin-left:12px;"><input type="radio" name="scan-mode" value="/scan_fast"> Fast Scan (KD-Tree)</label>
         <br><br>
         <button id="btn-scan" onclick="scanTemplate()" disabled>Start Pattern Matching</button>
+        <button id="btn-download-matches" class="btn-sm" onclick="downloadMatchResults()" disabled>Download Match Results</button>
         <h4 id="scan-status"></h4>
         <pre id="scan-result">Waiting for scan...</pre>
     </div>
@@ -352,17 +579,29 @@ html_content = """
         const wrapper   = document.getElementById('transform-wrapper');
         const svgDisplay = document.getElementById('svg-display');
         const svgOverlay = document.getElementById('svg-overlay');
+        const uploadResult = document.getElementById('upload-result');
         const polyG = document.getElementById('poly-group');
         const tmplG = document.getElementById('template-group');
         const hlG   = document.getElementById('hl-group');
+        const btnDownloadTemplate = document.getElementById('btn-download-template');
+        const btnDownloadMatches = document.getElementById('btn-download-matches');
 
         // --- State ---
         let scale = 1, panX = 0, panY = 0;
         let isPanning = false, panLastX = 0, panLastY = 0;
         let polyPts = [], polyClosed = false;
         let currentTemplate = null;
+        let currentMatchResult = null;
+        let currentCacheId = null;
         let contentW = 0, contentH = 0;
         let svgViewport = { x0: 0, y0: 0, w: 0, h: 0 };
+        const MAX_TEMPLATE_HIGHLIGHTS_TO_DRAW = 250;
+        const MAX_MATCHES_TO_DRAW = 200;
+        const MAX_HIGHLIGHTS_PER_MATCH_TO_DRAW = 80;
+        const MAX_TOTAL_HIGHLIGHTS_TO_DRAW = 1800;
+        const MAX_ENTITIES_PREVIEW = 60;
+        const MAX_MATCHES_PREVIEW = 80;
+        const MAX_POLYLINE_POINTS_DRAW = 400;
 
         // --- Transform ---
         function applyTransform() {
@@ -423,22 +662,133 @@ html_content = """
                 y: svgViewport.y0 + py * svgViewport.h,
             };
         }
+        function samplePoints(points, maxPoints) {
+            if (!points || points.length <= maxPoints) return points || [];
+            var step = Math.ceil(points.length / maxPoints);
+            var out = [];
+            for (var i = 0; i < points.length; i += step) out.push(points[i]);
+            var last = points[points.length - 1];
+            if (out.length === 0 || out[out.length - 1] !== last) out.push(last);
+            return out;
+        }
+        function setExtractPreview(result) {
+            if (!result || result.error) {
+                document.getElementById('extract-result').innerText = JSON.stringify(result, null, 2);
+                return;
+            }
+            var entities = result.entities_preview || result.entities || [];
+            var highlights = result.highlights || [];
+            var entityTotal = result.entity_count ?? entities.length;
+            var highlightTotal = result.highlight_count_total ?? highlights.length;
+            var preview = {
+                cache_id: result.cache_id,
+                template_id: result.template_id,
+                group_center: result.group_center,
+                entity_count: entityTotal,
+                highlight_count: highlightTotal,
+                highlight_count_returned: highlights.length,
+                entities_preview: entities.slice(0, MAX_ENTITIES_PREVIEW),
+            };
+            var text = JSON.stringify(preview, null, 2);
+            if (entityTotal > MAX_ENTITIES_PREVIEW) {
+                text += "\\n... entities preview truncated (" + Math.min(MAX_ENTITIES_PREVIEW, entities.length) + "/" + entityTotal + ")";
+            }
+            document.getElementById('extract-result').innerText = text;
+        }
+        function setScanPreview(data) {
+            if (!data || data.error) {
+                document.getElementById('scan-result').innerText = JSON.stringify(data, null, 2);
+                return;
+            }
+            var matches = data.matches || [];
+            var previewMatches = matches.slice(0, MAX_MATCHES_PREVIEW).map(function(m) {
+                return {
+                    dxf_x: m.dxf_x,
+                    dxf_y: m.dxf_y,
+                    render_pct_x: m.render_pct_x,
+                    render_pct_y: m.render_pct_y,
+                    highlight_count_total: m.highlight_count_total ?? (m.highlights ? m.highlights.length : 0),
+                    highlight_count_returned: m.highlight_count_returned ?? (m.highlights ? m.highlights.length : 0),
+                };
+            });
+            var preview = {
+                match_count: data.match_count || matches.length,
+                matches_preview: previewMatches,
+            };
+            var text = JSON.stringify(preview, null, 2);
+            if (matches.length > MAX_MATCHES_PREVIEW) {
+                text += "\\n... matches preview truncated (" + MAX_MATCHES_PREVIEW + "/" + matches.length + ")";
+            }
+            document.getElementById('scan-result').innerText = text;
+        }
+        function downloadJson(filename, payload) {
+            if (!payload) return;
+            var text = JSON.stringify(payload, null, 2);
+            var blob = new Blob([text], { type: 'application/json' });
+            var url = URL.createObjectURL(blob);
+            var a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+        async function downloadTemplateFingerprint() {
+            if (!currentTemplate) return;
+            if (currentTemplate.template_id && currentTemplate.cache_id) {
+                var res = await fetch('/template', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        cache_id: currentTemplate.cache_id,
+                        template_id: currentTemplate.template_id,
+                    })
+                });
+                var data = await res.json();
+                if (data.error) {
+                    document.getElementById('extract-result').innerText += "\\n" + data.error;
+                    return;
+                }
+                downloadJson('template_fingerprint.json', data);
+                return;
+            }
+            downloadJson('template_fingerprint.json', currentTemplate);
+        }
+        function downloadMatchResults() {
+            if (!currentMatchResult) return;
+            downloadJson('match_results.json', currentMatchResult);
+        }
 
         // --- Upload ---
         async function uploadDXF() {
             var fi = document.getElementById('dxf-file');
             if (!fi.files[0]) return alert("Please select a file");
+            var fastBuild = document.getElementById('fast-cache-build').checked;
             var fd = new FormData(); fd.append("file", fi.files[0]);
-            document.getElementById('extract-result').innerText = "Uploading and converting to SVG...";
+            fd.append("fast_build", fastBuild ? "true" : "false");
+            uploadResult.innerText = "Uploading and converting to SVG...";
             clearAll();
             var res = await fetch('/upload', { method: 'POST', body: fd });
             var data = await res.json();
-            if (data.svg) {
+            if (data.svg && data.cache_id) {
+                currentCacheId = data.cache_id;
                 svgDisplay.innerHTML = data.svg;
                 requestAnimationFrame(function() {
                     syncCanvasSize();
+                    var mode = data.build_mode || "accurate";
+                    var lines = [
+                        "Upload successful (" + mode + " build).",
+                        "Entity count: " + (data.entity_count ?? 0),
+                        "SVG render time: " + (data.svg_render_time_ms ?? 0) + " ms",
+                        "Cache build time: " + (data.cache_build_time_ms ?? 0) + " ms",
+                    ];
+                    uploadResult.innerText = lines.join("\\n");
                     document.getElementById('extract-result').innerText = "Upload successful. Click to add vertices and select a feature.";
                 });
+            } else {
+                currentCacheId = null;
+                uploadResult.innerText = JSON.stringify(data, null, 2);
             }
         }
         window.addEventListener('resize', function() {
@@ -545,24 +895,42 @@ html_content = """
         }
 
         async function closePoly() {
+            if (!currentCacheId) {
+                document.getElementById('extract-result').innerText = "Session expired. Please upload DXF again.";
+                return;
+            }
             polyClosed = true;
             drawPoly(null);
+            currentMatchResult = null;
+            btnDownloadMatches.disabled = true;
             var pct = polyPts.map(function(p){ return contentToSvgPct(p); });
             document.getElementById('extract-result').innerText = "Extracting features...";
             var res = await fetch('/extract', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ polygon_pct: pct })
+                body: JSON.stringify({ cache_id: currentCacheId, polygon_pct: pct })
             });
             var result = await res.json();
-            document.getElementById('extract-result').innerText = JSON.stringify(result, null, 2);
-            if (result.entities && result.entities.length > 0) {
-                currentTemplate = result;
+            setExtractPreview(result);
+            if (result.error) {
+                tmplG.innerHTML = '';
+                document.getElementById('btn-scan').disabled = true;
+                btnDownloadTemplate.disabled = true;
+            } else if ((result.entity_count || 0) > 0 && result.template_id) {
+                currentTemplate = {
+                    cache_id: result.cache_id || currentCacheId,
+                    template_id: result.template_id,
+                    group_center: result.group_center,
+                    entity_count: result.entity_count || 0,
+                    entities_preview: result.entities_preview || [],
+                };
                 renderTemplateHighlights(result.highlights || []);
                 document.getElementById('btn-scan').disabled = false;
+                btnDownloadTemplate.disabled = false;
             } else {
                 tmplG.innerHTML = '';
                 document.getElementById('extract-result').innerText += "\\nNo valid entities found in selection.";
                 document.getElementById('btn-scan').disabled = true;
+                btnDownloadTemplate.disabled = true;
             }
         }
 
@@ -570,7 +938,8 @@ html_content = """
             var NS = "http://www.w3.org/2000/svg";
             var sw = 2 / scale;
             tmplG.innerHTML = "";
-            highlights.forEach(function(h) {
+            var drawList = (highlights || []).slice(0, MAX_TEMPLATE_HIGHLIGHTS_TO_DRAW);
+            drawList.forEach(function(h) {
                 if (h.kind === "circle") {
                     var c = document.createElementNS(NS, "circle");
                     var cc = svgPctToContent(h.cx_pct, h.cy_pct);
@@ -582,32 +951,38 @@ html_content = """
                     c.setAttribute("stroke-width", sw);
                     tmplG.appendChild(c);
                 } else if (h.kind === "polyline") {
-                    for (var i = 0; i < h.points_pct.length - 1; i++) {
-                        var ln = document.createElementNS(NS, "line");
-                        var p1 = svgPctToContent(h.points_pct[i][0], h.points_pct[i][1]);
-                        var p2 = svgPctToContent(h.points_pct[i+1][0], h.points_pct[i+1][1]);
-                        ln.setAttribute("x1", p1.x);
-                        ln.setAttribute("y1", p1.y);
-                        ln.setAttribute("x2", p2.x);
-                        ln.setAttribute("y2", p2.y);
-                        ln.setAttribute("stroke", "#00c853");
-                        ln.setAttribute("stroke-width", sw);
-                        tmplG.appendChild(ln);
-                    }
+                    var pl = document.createElementNS(NS, "polyline");
+                    var pts = samplePoints(h.points_pct, MAX_POLYLINE_POINTS_DRAW).map(function(pt) {
+                        var p = svgPctToContent(pt[0], pt[1]);
+                        return p.x + "," + p.y;
+                    });
+                    pl.setAttribute("points", pts.join(" "));
+                    pl.setAttribute("fill", "none");
+                    pl.setAttribute("stroke", "#00c853");
+                    pl.setAttribute("stroke-width", sw);
+                    tmplG.appendChild(pl);
                 }
             });
+            if (highlights && highlights.length > MAX_TEMPLATE_HIGHLIGHTS_TO_DRAW) {
+                document.getElementById('extract-result').innerText +=
+                    "\\nHighlight draw capped: " + MAX_TEMPLATE_HIGHLIGHTS_TO_DRAW + "/" + highlights.length;
+            }
         }
 
         function clearPoly() {
             polyPts = []; polyClosed = false; polyG.innerHTML = '';
             tmplG.innerHTML = '';
             currentTemplate = null;
+            currentMatchResult = null;
             document.getElementById('btn-scan').disabled = true;
+            btnDownloadTemplate.disabled = true;
+            btnDownloadMatches.disabled = true;
             document.getElementById('extract-result').innerText = "Cleared. Click to start a new selection.";
         }
         function resetView() { scale = 1; panX = 0; panY = 0; applyTransform(); }
         function clearAll() {
             clearPoly(); hlG.innerHTML = '';
+            currentCacheId = null;
             resetView();
             document.getElementById('scan-status').innerText = '';
             document.getElementById('scan-result').innerText = 'Waiting for scan...';
@@ -615,29 +990,63 @@ html_content = """
 
         // --- Scan ---
         async function scanTemplate() {
-            if (!currentTemplate) return;
+            if (!currentTemplate || !currentCacheId || !currentTemplate.template_id) return;
             var endpoint = document.querySelector('input[name="scan-mode"]:checked').value;
             document.getElementById('scan-status').innerText = "Scanning...";
             document.getElementById('scan-result').innerText = "";
             hlG.innerHTML = "";
             var t0 = performance.now();
+            var payload = {
+                cache_id: currentCacheId,
+                template_id: currentTemplate.template_id,
+            };
             var res = await fetch(endpoint, {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(currentTemplate)
+                body: JSON.stringify(payload)
             });
             var data = await res.json();
             var elapsed = ((performance.now() - t0) / 1000).toFixed(2);
+            if (data.error) {
+                document.getElementById('scan-status').innerText = data.error;
+                document.getElementById('scan-result').innerText = JSON.stringify(data, null, 2);
+                currentMatchResult = null;
+                btnDownloadMatches.disabled = true;
+                return;
+            }
             document.getElementById('scan-status').innerText = 'Scan complete! Found ' + data.match_count + ' matches (' + elapsed + 's)';
-            document.getElementById('scan-result').innerText = JSON.stringify(data.matches, null, 2);
+            var noHighlightMatches = (data.matches || []).filter(function(m) {
+                return (m.highlight_count_total || 0) > 0 && (m.highlight_count_returned || 0) === 0;
+            }).length;
+            if (noHighlightMatches > 0) {
+                document.getElementById('scan-status').innerText +=
+                    ' | Server highlight payload capped for ' + noHighlightMatches + ' matches';
+            }
+            setScanPreview(data);
             renderHighlights(data.matches);
+            currentMatchResult = data;
+            btnDownloadMatches.disabled = false;
         }
 
         function renderHighlights(matches) {
             var NS = "http://www.w3.org/2000/svg";
             var sw = 2 / scale;
-            matches.forEach(function(match) {
+            hlG.innerHTML = "";
+            var drawMatches = (matches || []).slice(0, MAX_MATCHES_TO_DRAW);
+            var drawnHighlights = 0;
+            var droppedPerMatch = 0;
+            var droppedGlobal = 0;
+            drawMatches.forEach(function(match) {
                 if (!match.highlights) return;
-                match.highlights.forEach(function(h) {
+                if (drawnHighlights >= MAX_TOTAL_HIGHLIGHTS_TO_DRAW) {
+                    droppedGlobal += match.highlights.length;
+                    return;
+                }
+                var perMatch = match.highlights.slice(0, MAX_HIGHLIGHTS_PER_MATCH_TO_DRAW);
+                droppedPerMatch += Math.max(0, match.highlights.length - perMatch.length);
+                var remaining = MAX_TOTAL_HIGHLIGHTS_TO_DRAW - drawnHighlights;
+                var drawHs = perMatch.slice(0, remaining);
+                droppedGlobal += Math.max(0, perMatch.length - drawHs.length);
+                drawHs.forEach(function(h) {
                     if (h.kind === "circle") {
                         var c = document.createElementNS(NS, "circle");
                         var cc = svgPctToContent(h.cx_pct, h.cy_pct);
@@ -648,20 +1057,28 @@ html_content = """
                         c.setAttribute("stroke", "red"); c.setAttribute("stroke-width", sw);
                         hlG.appendChild(c);
                     } else if (h.kind === "polyline") {
-                        for (var i = 0; i < h.points_pct.length - 1; i++) {
-                            var ln = document.createElementNS(NS, "line");
-                            var p1 = svgPctToContent(h.points_pct[i][0], h.points_pct[i][1]);
-                            var p2 = svgPctToContent(h.points_pct[i+1][0], h.points_pct[i+1][1]);
-                            ln.setAttribute("x1", p1.x);
-                            ln.setAttribute("y1", p1.y);
-                            ln.setAttribute("x2", p2.x);
-                            ln.setAttribute("y2", p2.y);
-                            ln.setAttribute("stroke", "red"); ln.setAttribute("stroke-width", sw);
-                            hlG.appendChild(ln);
-                        }
+                        var pl = document.createElementNS(NS, "polyline");
+                        var pts = samplePoints(h.points_pct, MAX_POLYLINE_POINTS_DRAW).map(function(pt) {
+                            var p = svgPctToContent(pt[0], pt[1]);
+                            return p.x + "," + p.y;
+                        });
+                        pl.setAttribute("points", pts.join(" "));
+                        pl.setAttribute("fill", "none");
+                        pl.setAttribute("stroke", "red");
+                        pl.setAttribute("stroke-width", sw);
+                        hlG.appendChild(pl);
                     }
                 });
+                drawnHighlights += drawHs.length;
             });
+            if (matches && matches.length > MAX_MATCHES_TO_DRAW) {
+                document.getElementById('scan-status').innerText +=
+                    " | Highlight draw capped: " + MAX_MATCHES_TO_DRAW + "/" + matches.length;
+            }
+            if (droppedPerMatch > 0 || droppedGlobal > 0) {
+                document.getElementById('scan-status').innerText +=
+                    " | Draw detail capped (per-match: " + droppedPerMatch + ", global: " + droppedGlobal + ")";
+            }
         }
     </script>
 </body>
@@ -677,34 +1094,72 @@ async def read_root():
 
 
 @app.post("/upload")
-async def upload_dxf(file: UploadFile = File(...)):
-    with open(TEMP_DXF_PATH, "wb") as buffer:
-        buffer.write(await file.read())
-    doc = ezdxf.readfile(TEMP_DXF_PATH)
+async def upload_dxf(
+    file: UploadFile = File(...),
+    fast_build: bool = Form(False),
+):
+    raw = await file.read()
+    if not raw:
+        return JSONResponse(status_code=400, content={"error": "Empty upload"})
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".dxf", delete=False) as tmp:
+            tmp.write(raw)
+            tmp_path = tmp.name
+        doc = ezdxf.readfile(tmp_path)
+    except Exception as exc:
+        return JSONResponse(
+            status_code=400, content={"error": f"Failed to read DXF: {str(exc)}"}
+        )
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
     msp = doc.modelspace()
+    dxf_entity_count = len(msp)
     backend = SVGBackend()
     render_config = Configuration.defaults().with_changes(
         lineweight_scaling=SVG_LINEWEIGHT_SCALING
     )
+
+    t0 = time.perf_counter()
     Frontend(RenderContext(doc), backend, config=render_config).draw_layout(msp)
     page = layout.Page(0, 0, layout.Units.mm)
-    # Build global cache once (fingerprints + KD-Tree + type index)
-    _build_cache(msp)
-    return {"status": "success", "svg": backend.get_string(page)}
+    svg = backend.get_string(page)
+    svg_render_time_ms = int((time.perf_counter() - t0) * 1000)
+
+    t1 = time.perf_counter()
+    cache_payload = _build_cache_payload(msp, fast_build=fast_build)
+    cache_build_time_ms = int((time.perf_counter() - t1) * 1000)
+    cache_id = _store_cache(cache_payload)
+    return {
+        "status": "success",
+        "cache_id": cache_id,
+        "build_mode": "fast" if fast_build else "accurate",
+        "dxf_entity_count": dxf_entity_count,
+        "entity_count": len(cache_payload["fingerprints"]),
+        "svg_render_time_ms": svg_render_time_ms,
+        "cache_build_time_ms": cache_build_time_ms,
+        "svg": svg,
+    }
 
 
 @app.post("/extract")
 async def extract_template(data: dict = Body(...)):
-    if not _cache["ready"]:
+    cache_id = data.get("cache_id")
+    cache_payload = _get_cache(cache_id)
+    if cache_payload is None:
         return JSONResponse(
-            status_code=400, content={"error": "Please upload a file first"}
+            status_code=400,
+            content={"error": "Invalid or expired cache_id. Please upload a file again."},
         )
 
     polygon_pct = data.get("polygon_pct", [])
     if len(polygon_pct) < 3:
-        return {"entities": []}
+        return {"entities": [], "highlights": []}
 
-    bounds = _cache["bounds"]
+    bounds = cache_payload["bounds"]
 
     # Convert percentage vertices to DXF coordinates
     dxf_vertices = [
@@ -719,12 +1174,12 @@ async def extract_template(data: dict = Body(...)):
     # Filter directly from cache (no linemerge recomputation)
     entities_found = [
         f
-        for f in _cache["fingerprints"]
-        if roi_polygon.contains(Point(f["x"], f["y"]))
+        for f in cache_payload["fingerprints"]
+        if roi_polygon.covers(Point(f["x"], f["y"]))
     ]
 
     if not entities_found:
-        return {"entities": []}
+        return {"entities": [], "highlights": []}
 
     # Compute group centroid
     group_cx = sum(e["x"] for e in entities_found) / len(entities_found)
@@ -734,16 +1189,60 @@ async def extract_template(data: dict = Body(...)):
     entities_clean = [
         {k: v for k, v in e.items() if k != "geometry"} for e in entities_found
     ]
-    highlights = [geometry_to_render_pct(e["geometry"], bounds) for e in entities_found]
-
-    return {
+    template_payload = {
         "group_center": {"x": round(group_cx, 3), "y": round(group_cy, 3)},
         "entities": entities_clean,
+    }
+    template_id = _store_extracted_template(
+        cache_id, template_payload["group_center"], entities_clean
+    )
+    all_highlights = [geometry_to_render_pct(e["geometry"], bounds) for e in entities_found]
+    highlights = [
+        _compact_render_highlight(h)
+        for h in all_highlights[:MAX_EXTRACT_HIGHLIGHTS_RETURN]
+    ]
+
+    return {
+        "cache_id": cache_id,
+        "template_id": template_id,
+        "group_center": template_payload["group_center"],
+        "entity_count": len(entities_clean),
+        "entities_preview": entities_clean[:MAX_EXTRACT_ENTITIES_PREVIEW],
         "highlights": highlights,
+        "highlight_count_total": len(all_highlights),
+        "highlight_count_returned": len(highlights),
+        "highlight_truncated": len(all_highlights) > len(highlights),
     }
 
 
-def _build_match(anchor_idx_or_feat, anchor_tmpl, group_center, used, bounds, all_fp):
+@app.post("/template")
+async def get_template(data: dict = Body(...)):
+    cache_id = data.get("cache_id")
+    template_id = data.get("template_id")
+    template = _load_extracted_template(cache_id, template_id)
+    if template is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Template not found. Please extract template again."},
+        )
+    return {
+        "cache_id": cache_id,
+        "template_id": template_id,
+        "group_center": template["group_center"],
+        "entities": template["entities"],
+    }
+
+
+def _build_match(
+    anchor_idx_or_feat,
+    anchor_tmpl,
+    group_center,
+    used,
+    bounds,
+    all_fp,
+    *,
+    max_highlights=MAX_SCAN_HIGHLIGHTS_RETURN,
+):
     """Shared match result builder. Anchor can be int(index) or dict(feature)."""
     if isinstance(anchor_idx_or_feat, (int, np.integer)):
         af = all_fp[int(anchor_idx_or_feat)]
@@ -763,7 +1262,8 @@ def _build_match(anchor_idx_or_feat, anchor_tmpl, group_center, used, bounds, al
     rpy = (bounds["max_y"] - mcy) / bounds["height"]
 
     mf = [af] + [all_fp[i] for i in used]
-    hl = [geometry_to_render_pct(f["geometry"], bounds) for f in mf]
+    selected = mf if max_highlights is None else mf[:max_highlights]
+    hl = [_compact_render_highlight(geometry_to_render_pct(f["geometry"], bounds)) for f in selected]
 
     return {
         "dxf_x": round(mcx, 3),
@@ -771,23 +1271,52 @@ def _build_match(anchor_idx_or_feat, anchor_tmpl, group_center, used, bounds, al
         "render_pct_x": round(rpx, 4),
         "render_pct_y": round(rpy, 4),
         "highlights": hl,
+        "highlight_count_total": len(mf),
+        "highlight_count_returned": len(hl),
+        "highlight_truncated": len(hl) < len(mf),
     }
+
+
+def _trim_match_highlights(matches, max_with_highlights=MAX_SCAN_MATCHES_WITH_HIGHLIGHTS):
+    """Keep highlights only for the first N matches to cap payload size."""
+    if len(matches) <= max_with_highlights:
+        return matches
+    for m in matches[max_with_highlights:]:
+        m["highlights"] = []
+        m["highlight_count_returned"] = 0
+        m["highlight_truncated"] = m.get("highlight_count_total", 0) > 0
+    return matches
 
 
 @app.post("/scan")
 async def scan_dxf(template: dict = Body(...)):
     """Standard scan: cache + KD-Tree + bipartite matching (Python loop)."""
-    if not _cache["ready"]:
-        return JSONResponse(status_code=400, content={"error": "Please upload a file first"})
+    cache_payload = _get_cache(template.get("cache_id"))
+    if cache_payload is None:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Invalid or expired cache_id. Please upload a file again."},
+        )
 
-    bounds = _cache["bounds"]
-    all_fp = _cache["fingerprints"]
-    tree = _cache["tree"]
-    type_index = _cache["type_index"]
-    sizes = _cache["sizes"]
+    bounds = cache_payload["bounds"]
+    all_fp = cache_payload["fingerprints"]
+    tree = cache_payload["tree"]
+    type_index = cache_payload["type_index"]
+    sizes = cache_payload["sizes"]
 
-    entities = template.get("entities", [])
-    group_center = template.get("group_center", None)
+    template_id = template.get("template_id")
+    if template_id:
+        stored_template = _load_extracted_template(template.get("cache_id"), template_id)
+        if stored_template is None:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "Template not found. Please extract template again."},
+            )
+        entities = stored_template.get("entities", [])
+        group_center = stored_template.get("group_center", None)
+    else:
+        entities = template.get("entities", [])
+        group_center = template.get("group_center", None)
 
     if not entities or tree is None:
         return {"match_count": 0, "matches": []}
@@ -795,22 +1324,18 @@ async def scan_dxf(template: dict = Body(...)):
     # Single-entity template: search directly by type + size
     if len(entities) == 1:
         anchor_tmpl = entities[0]
-        group_center = template.get("group_center", None)
-        anchor_size_tol = max(SIZE_TOL_MIN, anchor_tmpl["size"] * SIZE_TOL_RATIO)
-
+        matched_indices = _single_entity_matches(all_fp, anchor_tmpl)
         matches_found = [
             _build_match(i, anchor_tmpl, group_center, set(), bounds, all_fp)
-            for i, f in enumerate(all_fp)
-            if f["type"] == anchor_tmpl["type"]
-            and abs(f["size"] - anchor_tmpl["size"]) < anchor_size_tol
+            for i in matched_indices
         ]
         unique = list(
             {(m["render_pct_x"], m["render_pct_y"]): m for m in matches_found}.values()
         )
-        return {"match_count": len(unique), "matches": unique}
+        return {"match_count": len(unique), "matches": _trim_match_highlights(unique)}
 
     # Pick the rarest entity as anchor
-    anchor_idx = _pick_anchor(entities, type_index, sizes)
+    anchor_idx = _pick_anchor(entities, all_fp, type_index, sizes)
     anchor_tmpl = entities[anchor_idx]
     others = [entities[i] for i in range(len(entities)) if i != anchor_idx]
 
@@ -822,6 +1347,7 @@ async def scan_dxf(template: dict = Body(...)):
         d = calculate_distance(anchor_pt, (o["x"], o["y"]))
         targets.append(
             {
+                "entity": o,
                 "type": o["type"],
                 "size": o["size"],
                 "size_tol": max(SIZE_TOL_MIN, o["size"] * SIZE_TOL_RATIO),
@@ -833,11 +1359,14 @@ async def scan_dxf(template: dict = Body(...)):
     max_tol = max(t["dist_tol"] for t in targets)
     search_r = max(t["dist"] for t in targets) + max_tol
 
-    potential = [
+    potential_base = [
         (i, f)
         for i, f in enumerate(all_fp)
         if f["type"] == anchor_tmpl["type"]
         and abs(f["size"] - anchor_tmpl["size"]) < anchor_size_tol
+    ]
+    potential = [
+        (i, f) for i, f in potential_base if _single_entity_plugin_pass(anchor_tmpl, f)
     ]
 
     matches_found = []
@@ -852,9 +1381,7 @@ async def scan_dxf(template: dict = Body(...)):
             valid = []
             for idx in local_set:
                 f = all_fp[idx]
-                if f["type"] != t["type"]:
-                    continue
-                if abs(f["size"] - t["size"]) >= t["size_tol"]:
+                if not _entity_basic_match(t["entity"], f, size_tol=t["size_tol"]):
                     continue
                 d = calculate_distance(cp, (f["x"], f["y"]))
                 if abs(d - t["dist"]) < t["dist_tol"]:
@@ -876,24 +1403,39 @@ async def scan_dxf(template: dict = Body(...)):
     unique = list(
         {(m["render_pct_x"], m["render_pct_y"]): m for m in matches_found}.values()
     )
-    return {"match_count": len(unique), "matches": unique}
+    return {"match_count": len(unique), "matches": _trim_match_highlights(unique)}
 
 
 @app.post("/scan_fast")
 async def scan_dxf_fast(template: dict = Body(...)):
     """Fast scan: cache + batch KD-Tree + numpy vectorization + bipartite matching."""
-    if not _cache["ready"]:
-        return JSONResponse(status_code=400, content={"error": "Please upload a file first"})
+    cache_payload = _get_cache(template.get("cache_id"))
+    if cache_payload is None:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Invalid or expired cache_id. Please upload a file again."},
+        )
 
-    bounds = _cache["bounds"]
-    all_fp = _cache["fingerprints"]
-    coords = _cache["coords"]
-    sizes = _cache["sizes"]
-    tree = _cache["tree"]
-    type_index = _cache["type_index"]
+    bounds = cache_payload["bounds"]
+    all_fp = cache_payload["fingerprints"]
+    coords = cache_payload["coords"]
+    sizes = cache_payload["sizes"]
+    tree = cache_payload["tree"]
+    type_index = cache_payload["type_index"]
 
-    entities = template.get("entities", [])
-    group_center = template.get("group_center", None)
+    template_id = template.get("template_id")
+    if template_id:
+        stored_template = _load_extracted_template(template.get("cache_id"), template_id)
+        if stored_template is None:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "Template not found. Please extract template again."},
+            )
+        entities = stored_template.get("entities", [])
+        group_center = stored_template.get("group_center", None)
+    else:
+        entities = template.get("entities", [])
+        group_center = template.get("group_center", None)
 
     if not entities or tree is None:
         return {"match_count": 0, "matches": []}
@@ -901,27 +1443,18 @@ async def scan_dxf_fast(template: dict = Body(...)):
     # Single-entity template: search directly by type + size
     if len(entities) == 1:
         anchor_tmpl = entities[0]
-        group_center = template.get("group_center", None)
-        a_type = anchor_tmpl["type"]
-        if a_type not in type_index:
-            return {"match_count": 0, "matches": []}
-
-        anchor_size_tol = max(SIZE_TOL_MIN, anchor_tmpl["size"] * SIZE_TOL_RATIO)
-        a_idx = type_index[a_type]
-        mask = np.abs(sizes[a_idx] - anchor_tmpl["size"]) < anchor_size_tol
-        potential = a_idx[mask]
-
+        matched_indices = _single_entity_matches(all_fp, anchor_tmpl)
         matches_found = [
             _build_match(int(ai), anchor_tmpl, group_center, set(), bounds, all_fp)
-            for ai in potential
+            for ai in matched_indices
         ]
         unique = list(
             {(m["render_pct_x"], m["render_pct_y"]): m for m in matches_found}.values()
         )
-        return {"match_count": len(unique), "matches": unique}
+        return {"match_count": len(unique), "matches": _trim_match_highlights(unique)}
 
     # Pick the rarest entity as anchor
-    anchor_idx = _pick_anchor(entities, type_index, sizes)
+    anchor_idx = _pick_anchor(entities, all_fp, type_index, sizes)
     anchor_tmpl = entities[anchor_idx]
     others = [entities[i] for i in range(len(entities)) if i != anchor_idx]
 
@@ -933,6 +1466,7 @@ async def scan_dxf_fast(template: dict = Body(...)):
         d = float(np.linalg.norm(anchor_pt - [o["x"], o["y"]]))
         targets.append(
             {
+                "entity": o,
                 "type": o["type"],
                 "size": o["size"],
                 "size_tol": max(SIZE_TOL_MIN, o["size"] * SIZE_TOL_RATIO),
@@ -950,7 +1484,16 @@ async def scan_dxf_fast(template: dict = Body(...)):
         return {"match_count": 0, "matches": []}
     a_idx = type_index[a_type]
     mask = np.abs(sizes[a_idx] - anchor_tmpl["size"]) < anchor_size_tol
-    potential = a_idx[mask]
+    potential_base = a_idx[mask]
+    potential = potential_base
+    potential = np.array(
+        [
+            int(i)
+            for i in potential
+            if _single_entity_plugin_pass(anchor_tmpl, all_fp[int(i)])
+        ],
+        dtype=np.intp,
+    )
 
     if len(potential) == 0:
         return {"match_count": 0, "matches": []}
@@ -994,6 +1537,17 @@ async def scan_dxf_fast(template: dict = Body(...)):
             if len(cands) == 0:
                 skip = True
                 break
+            cands = np.array(
+                [
+                    int(ci)
+                    for ci in cands
+                    if _single_entity_plugin_pass(t["entity"], all_fp[int(ci)])
+                ],
+                dtype=np.intp,
+            )
+            if len(cands) == 0:
+                skip = True
+                break
             dists = np.linalg.norm(coords[cands] - cand, axis=1)
             d_mask = np.abs(dists - t["dist"]) < t["dist_tol"]
             valid = cands[d_mask]
@@ -1014,7 +1568,7 @@ async def scan_dxf_fast(template: dict = Body(...)):
     unique = list(
         {(m["render_pct_x"], m["render_pct_y"]): m for m in matches_found}.values()
     )
-    return {"match_count": len(unique), "matches": unique}
+    return {"match_count": len(unique), "matches": _trim_match_highlights(unique)}
 
 
 if __name__ == "__main__":
