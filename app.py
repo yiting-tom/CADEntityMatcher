@@ -5,6 +5,8 @@ import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
+import json
+from collections import Counter
 from typing import Callable
 import numpy as np
 from scipy.spatial import cKDTree
@@ -51,6 +53,21 @@ MATCH_SCORE_DIST_WEIGHT = 0.45
 MATCH_SCORE_SHAPE_WEIGHT = 0.10
 BOUNDS_EPS = 1e-9
 MAX_INSERT_EXPLODE_DEPTH = 8
+CIRCLE_MODE_RADIUS_DECIMALS = 6
+CIRCLE_MODE_MIN_GROUP_COUNT = 2
+DEFAULT_DROP_ENTITY_TYPES = {
+    "TEXT",
+    "MTEXT",
+    "DIMENSION",
+    "LEADER",
+    "MLEADER",
+    "HATCH",
+    "IMAGE",
+    "WIPEOUT",
+    "POINT",
+    "XLINE",
+    "RAY",
+}
 
 
 def snap(val):
@@ -157,6 +174,146 @@ def _iter_flat_entities(entities, *, depth=0, max_depth=MAX_INSERT_EXPLODE_DEPTH
                 continue
             continue
         yield entity
+
+
+def _sanitize_insert_entity(insert):
+    """Fix degenerate INSERT transform attributes in-place."""
+    changed = False
+    for attr in ("xscale", "yscale", "zscale"):
+        if not insert.dxf.hasattr(attr):
+            continue
+        try:
+            v = float(getattr(insert.dxf, attr))
+        except Exception:
+            v = 1.0
+        if not math.isfinite(v) or abs(v) < BOUNDS_EPS:
+            setattr(insert.dxf, attr, 1.0)
+            changed = True
+
+    if insert.dxf.hasattr("rotation"):
+        try:
+            rot = float(insert.dxf.rotation)
+        except Exception:
+            rot = 0.0
+        if not math.isfinite(rot):
+            insert.dxf.rotation = 0.0
+            changed = True
+
+    if insert.dxf.hasattr("extrusion"):
+        try:
+            ex = insert.dxf.extrusion
+            mag = math.sqrt(ex.x * ex.x + ex.y * ex.y + ex.z * ex.z)
+        except Exception:
+            mag = 0.0
+        if mag < BOUNDS_EPS or not math.isfinite(mag):
+            insert.dxf.extrusion = (0.0, 0.0, 1.0)
+            changed = True
+    return changed
+
+
+def _iter_all_entity_spaces(doc):
+    """Yield modelspace and all block entity spaces."""
+    yield doc.modelspace()
+    for blk in doc.blocks:
+        yield blk
+
+
+def _sorted_type_counts(counter):
+    """Sort type counts by count desc then name asc."""
+    return dict(sorted(counter.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
+def _count_entity_types(entities):
+    """Count DXF entity types from an iterable of entities."""
+    c = Counter()
+    for e in entities:
+        try:
+            c[e.dxftype().upper()] += 1
+        except Exception:
+            continue
+    return _sorted_type_counts(c)
+
+
+def _drop_entities_by_type(doc, type_names):
+    """Drop entities by DXF type from modelspace and blocks."""
+    targets = {str(t).upper() for t in type_names}
+    removed = 0
+    removed_by_type = {}
+    for space in _iter_all_entity_spaces(doc):
+        for entity in list(space):
+            etype = entity.dxftype().upper()
+            if etype not in targets:
+                continue
+            try:
+                space.delete_entity(entity)
+                removed += 1
+                removed_by_type[etype] = removed_by_type.get(etype, 0) + 1
+            except Exception:
+                pass
+    return removed, removed_by_type
+
+
+def _parse_entity_types_form(raw):
+    """Parse entity type list from form input (JSON array or CSV string)."""
+    if raw is None:
+        return []
+    text = str(raw).strip()
+    if not text:
+        return []
+
+    values = []
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            values = [str(v) for v in parsed]
+        elif isinstance(parsed, str):
+            values = [parsed]
+    except Exception:
+        values = text.replace(";", ",").split(",")
+
+    out = []
+    seen = set()
+    for v in values:
+        t = str(v).strip().upper()
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out
+
+
+def _sanitize_doc_inserts(doc):
+    """Sanitize INSERT attributes across modelspace and blocks."""
+    scanned = 0
+    fixed = 0
+    for space in _iter_all_entity_spaces(doc):
+        for entity in space:
+            if entity.dxftype() != "INSERT":
+                continue
+            scanned += 1
+            if _sanitize_insert_entity(entity):
+                fixed += 1
+    return scanned, fixed
+
+
+def _drop_unrenderable_inserts(doc):
+    """Remove INSERT entities that still fail virtual expansion."""
+    removed = 0
+    for space in _iter_all_entity_spaces(doc):
+        for entity in list(space):
+            if entity.dxftype() != "INSERT":
+                continue
+            try:
+                # Force virtual transformation path used by renderer.
+                for _ in entity.virtual_entities():
+                    break
+            except Exception:
+                try:
+                    space.delete_entity(entity)
+                    removed += 1
+                except Exception:
+                    pass
+    return removed
 
 
 def _polyline_shape_signature(points):
@@ -481,11 +638,95 @@ def _pick_anchor(entities, all_fp, type_index, sizes):
 SingleEntityPlugin = Callable[[dict, dict], bool]
 SINGLE_ENTITY_MATCH_PLUGINS: list[SingleEntityPlugin] = []
 
+UploadDocPlugin = Callable[[object, dict], dict]
+UPLOAD_DOC_PLUGINS: dict[str, UploadDocPlugin] = {}
+
 
 def register_single_entity_plugin(plugin: SingleEntityPlugin):
     """Register a single-entity matching plugin."""
     if plugin not in SINGLE_ENTITY_MATCH_PLUGINS:
         SINGLE_ENTITY_MATCH_PLUGINS.append(plugin)
+
+
+def register_upload_doc_plugin(name: str, plugin: UploadDocPlugin):
+    """Register a document pre-process plugin used by /upload."""
+    key = str(name).strip()
+    if key:
+        UPLOAD_DOC_PLUGINS[key] = plugin
+
+
+def _run_upload_doc_plugin(name: str, doc, options=None):
+    """Run one upload plugin by name."""
+    plugin = UPLOAD_DOC_PLUGINS.get(str(name))
+    if plugin is None:
+        return {"enabled": False, "applied": False, "error": f"Unknown plugin: {name}"}
+    try:
+        result = plugin(doc, options or {})
+        if isinstance(result, dict):
+            return result
+        return {"enabled": True, "applied": False, "error": "Invalid plugin result"}
+    except Exception as exc:
+        return {"enabled": True, "applied": False, "error": str(exc)}
+
+
+def _plugin_drop_most_common_circle_size(doc, options):
+    """Drop all CIRCLE entities in the most frequent radius bucket."""
+    decimals = int(options.get("decimals", CIRCLE_MODE_RADIUS_DECIMALS))
+    min_group_count = int(options.get("min_group_count", CIRCLE_MODE_MIN_GROUP_COUNT))
+    buckets = {}
+
+    msp = doc.modelspace()
+    for entity in list(msp):
+        if entity.dxftype() != "CIRCLE":
+            continue
+        try:
+            radius = float(entity.dxf.radius)
+        except Exception:
+            continue
+        if not math.isfinite(radius) or radius <= BOUNDS_EPS:
+            continue
+        key = round(radius, decimals)
+        buckets.setdefault(key, []).append((msp, entity))
+
+    if not buckets:
+        return {
+            "enabled": True,
+            "applied": False,
+            "removed_count": 0,
+            "radius": None,
+            "bucket_count": 0,
+            "unique_radius_count": 0,
+        }
+
+    best_radius, best_bucket = sorted(
+        buckets.items(), key=lambda kv: (-len(kv[1]), kv[0])
+    )[0]
+    if len(best_bucket) < max(1, min_group_count):
+        return {
+            "enabled": True,
+            "applied": False,
+            "removed_count": 0,
+            "radius": best_radius,
+            "bucket_count": len(best_bucket),
+            "unique_radius_count": len(buckets),
+        }
+
+    removed = 0
+    for space, entity in best_bucket:
+        try:
+            space.delete_entity(entity)
+            removed += 1
+        except Exception:
+            pass
+
+    return {
+        "enabled": True,
+        "applied": True,
+        "removed_count": int(removed),
+        "radius": float(best_radius),
+        "bucket_count": len(best_bucket),
+        "unique_radius_count": len(buckets),
+    }
 
 
 def _plugin_composite_shape_signature(template_entity, candidate_feature):
@@ -645,6 +886,9 @@ def _best_scored_matching(adj_scored):
 
 
 register_single_entity_plugin(_plugin_composite_shape_signature)
+register_upload_doc_plugin(
+    "drop_most_common_circle_size", _plugin_drop_most_common_circle_size
+)
 
 
 # --- HTML frontend ---
@@ -668,6 +912,8 @@ html_content = """
         .btn-sm:hover { background: #5a6268; }
         pre { background: #eee; padding: 10px; border-radius: 4px; overflow-x: auto; max-height: 250px; }
         .hint { color: #666; font-size: 0.9em; margin: 6px 0; }
+        .type-grid { display: flex; flex-wrap: wrap; gap: 6px 12px; margin-top: 6px; }
+        .type-opt { font-size: 0.9em; }
     </style>
 </head>
 <body>
@@ -679,6 +925,31 @@ html_content = """
         <label style="margin-left:10px;">
             <input type="checkbox" id="fast-cache-build"> Fast Cache Build (skip ELLIPSE/SPLINE)
         </label>
+        <label style="margin-left:10px;">
+            <input type="checkbox" id="drop-noisy-types" checked> Enable Entity Type Filtering
+        </label>
+        <label style="margin-left:10px;">
+            <input type="checkbox" id="drop-most-common-circle"> Plugin: Drop Most Common CIRCLE Size
+        </label>
+        <details style="margin-top:8px;">
+            <summary>Choose entity types to drop</summary>
+            <div class="type-grid">
+                <label class="type-opt"><input type="checkbox" class="drop-type-opt" value="TEXT" checked> TEXT</label>
+                <label class="type-opt"><input type="checkbox" class="drop-type-opt" value="MTEXT" checked> MTEXT</label>
+                <label class="type-opt"><input type="checkbox" class="drop-type-opt" value="DIMENSION" checked> DIMENSION</label>
+                <label class="type-opt"><input type="checkbox" class="drop-type-opt" value="LEADER" checked> LEADER</label>
+                <label class="type-opt"><input type="checkbox" class="drop-type-opt" value="MLEADER" checked> MLEADER</label>
+                <label class="type-opt"><input type="checkbox" class="drop-type-opt" value="HATCH" checked> HATCH</label>
+                <label class="type-opt"><input type="checkbox" class="drop-type-opt" value="IMAGE" checked> IMAGE</label>
+                <label class="type-opt"><input type="checkbox" class="drop-type-opt" value="WIPEOUT" checked> WIPEOUT</label>
+                <label class="type-opt"><input type="checkbox" class="drop-type-opt" value="POINT" checked> POINT</label>
+                <label class="type-opt"><input type="checkbox" class="drop-type-opt" value="XLINE" checked> XLINE</label>
+                <label class="type-opt"><input type="checkbox" class="drop-type-opt" value="RAY" checked> RAY</label>
+            </div>
+            <div style="margin-top:6px;">
+                <input id="drop-type-custom" type="text" style="width:min(100%,560px);" placeholder="Custom types (comma-separated), e.g. ATTDEF,ATTRIB">
+            </div>
+        </details>
         <button onclick="uploadDXF()">Upload &amp; Render SVG</button>
         <h4>Upload Stats:</h4>
         <pre id="upload-result">No upload yet</pre>
@@ -903,14 +1174,31 @@ html_content = """
             if (!currentMatchResult) return;
             downloadJson('match_results.json', currentMatchResult);
         }
+        function collectDropEntityTypes() {
+            var selected = Array.from(document.querySelectorAll('.drop-type-opt:checked'))
+                .map(function(el) { return (el.value || '').trim().toUpperCase(); })
+                .filter(Boolean);
+            var customRaw = (document.getElementById('drop-type-custom').value || '');
+            var custom = customRaw.split(/[\\s,;]+/)
+                .map(function(s) { return s.trim().toUpperCase(); })
+                .filter(Boolean);
+            var merged = selected.concat(custom);
+            return Array.from(new Set(merged));
+        }
 
         // --- Upload ---
         async function uploadDXF() {
             var fi = document.getElementById('dxf-file');
             if (!fi.files[0]) return alert("Please select a file");
             var fastBuild = document.getElementById('fast-cache-build').checked;
+            var dropNoisy = document.getElementById('drop-noisy-types').checked;
+            var dropMostCommonCircle = document.getElementById('drop-most-common-circle').checked;
+            var dropTypes = dropNoisy ? collectDropEntityTypes() : [];
             var fd = new FormData(); fd.append("file", fi.files[0]);
             fd.append("fast_build", fastBuild ? "true" : "false");
+            fd.append("drop_noisy_types", dropNoisy ? "true" : "false");
+            fd.append("drop_entity_types", JSON.stringify(dropTypes));
+            fd.append("drop_most_common_circle", dropMostCommonCircle ? "true" : "false");
             uploadResult.innerText = "Uploading and converting to SVG...";
             clearAll();
             var res = await fetch('/upload', { method: 'POST', body: fd });
@@ -921,9 +1209,20 @@ html_content = """
                 requestAnimationFrame(function() {
                     syncCanvasSize();
                     var mode = data.build_mode || "accurate";
+                    var typeCountsBefore = data.entity_type_counts_before_drop || {};
+                    var typeCountsAfter = data.entity_type_counts_after_drop || {};
                     var lines = [
                         "Upload successful (" + mode + " build).",
                         "Entity count: " + (data.entity_count ?? 0),
+                        "Entity types (before drop): " + JSON.stringify(typeCountsBefore),
+                        "Entity types (after drop): " + JSON.stringify(typeCountsAfter),
+                        "Drop noisy types: " + (data.drop_noisy_types_enabled ? "ON" : "OFF"),
+                        "Drop target types: " + (data.drop_selected_types ? data.drop_selected_types.join(",") : "[]"),
+                        "Dropped entity count: " + (data.drop_removed_count ?? 0),
+                        "Dropped type details: " + (data.drop_removed_by_type ? JSON.stringify(data.drop_removed_by_type) : "{}"),
+                        "Plugin drop-most-common-circle: " + (data.drop_most_common_circle_enabled ? "ON" : "OFF"),
+                        "Plugin removed/radius/group: " + (data.drop_most_common_circle_removed ?? 0) + "/" + (data.drop_most_common_circle_radius ?? "null") + "/" + (data.drop_most_common_circle_bucket_count ?? 0),
+                        "INSERT scanned/fixed/removed: " + (data.insert_scanned ?? 0) + "/" + (data.insert_fixed ?? 0) + "/" + (data.insert_removed ?? 0),
                         "Coordinate basis: " + (data.coord_basis || "dxf_extents"),
                         "SVG render time: " + (data.svg_render_time_ms ?? 0) + " ms",
                         "Cache build time: " + (data.cache_build_time_ms ?? 0) + " ms",
@@ -1246,6 +1545,9 @@ async def read_root():
 async def upload_dxf(
     file: UploadFile = File(...),
     fast_build: bool = Form(False),
+    drop_noisy_types: bool = Form(True),
+    drop_entity_types: str = Form(""),
+    drop_most_common_circle: bool = Form(False),
 ):
     raw = await file.read()
     if not raw:
@@ -1265,15 +1567,89 @@ async def upload_dxf(
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
 
+    type_counts_before_drop = _count_entity_types(doc.modelspace())
+    drop_removed_count = 0
+    drop_removed_by_type = {}
+    drop_selected_types = _parse_entity_types_form(drop_entity_types)
+    if not drop_selected_types:
+        drop_selected_types = sorted(DEFAULT_DROP_ENTITY_TYPES)
+    if drop_noisy_types:
+        drop_removed_count, drop_removed_by_type = _drop_entities_by_type(
+            doc, drop_selected_types
+        )
+
+    circle_plugin_result = {
+        "enabled": bool(drop_most_common_circle),
+        "applied": False,
+        "removed_count": 0,
+        "radius": None,
+        "bucket_count": 0,
+        "unique_radius_count": 0,
+    }
+    if drop_most_common_circle:
+        circle_plugin_result = _run_upload_doc_plugin(
+            "drop_most_common_circle_size",
+            doc,
+            {
+                "decimals": CIRCLE_MODE_RADIUS_DECIMALS,
+                "min_group_count": CIRCLE_MODE_MIN_GROUP_COUNT,
+            },
+        )
+
     msp = doc.modelspace()
     dxf_entity_count = len(msp)
+    type_counts_after_drop = _count_entity_types(msp)
+    insert_scanned, insert_fixed = _sanitize_doc_inserts(doc)
     backend = SVGBackend()
     render_config = Configuration.defaults().with_changes(
         lineweight_scaling=SVG_LINEWEIGHT_SCALING
     )
 
     t0 = time.perf_counter()
-    Frontend(RenderContext(doc), backend, config=render_config).draw_layout(msp)
+    render_retry_removed_inserts = 0
+    try:
+        Frontend(RenderContext(doc), backend, config=render_config).draw_layout(msp)
+    except Exception:
+        # Some DWG->DXF files contain degenerate INSERT transforms.
+        # Drop only INSERT entities that cannot be virtually expanded, then retry once.
+        render_retry_removed_inserts = _drop_unrenderable_inserts(doc)
+        msp = doc.modelspace()
+        backend = SVGBackend()
+        try:
+            Frontend(RenderContext(doc), backend, config=render_config).draw_layout(msp)
+        except Exception as exc:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": f"Failed to render DXF: {str(exc)}",
+                    "drop_noisy_types_enabled": bool(drop_noisy_types),
+                    "drop_selected_types": drop_selected_types if drop_noisy_types else [],
+                    "drop_removed_count": int(drop_removed_count),
+                    "drop_removed_by_type": drop_removed_by_type,
+                    "entity_type_counts_before_drop": type_counts_before_drop,
+                    "entity_type_counts_after_drop": type_counts_after_drop,
+                    "drop_most_common_circle_enabled": bool(
+                        circle_plugin_result.get("enabled", False)
+                    ),
+                    "drop_most_common_circle_applied": bool(
+                        circle_plugin_result.get("applied", False)
+                    ),
+                    "drop_most_common_circle_removed": int(
+                        circle_plugin_result.get("removed_count", 0)
+                    ),
+                    "drop_most_common_circle_radius": circle_plugin_result.get("radius"),
+                    "drop_most_common_circle_bucket_count": int(
+                        circle_plugin_result.get("bucket_count", 0)
+                    ),
+                    "drop_most_common_circle_unique_radius_count": int(
+                        circle_plugin_result.get("unique_radius_count", 0)
+                    ),
+                    "drop_most_common_circle_error": circle_plugin_result.get("error"),
+                    "insert_scanned": insert_scanned,
+                    "insert_fixed": insert_fixed,
+                    "insert_removed": render_retry_removed_inserts,
+                },
+            )
     render_bounds = None
     render_mapping = None
     try:
@@ -1317,10 +1693,36 @@ async def upload_dxf(
         "status": "success",
         "cache_id": cache_id,
         "build_mode": "fast" if fast_build else "accurate",
+        "drop_noisy_types_enabled": bool(drop_noisy_types),
+        "drop_selected_types": drop_selected_types if drop_noisy_types else [],
+        "drop_removed_count": int(drop_removed_count),
+        "drop_removed_by_type": drop_removed_by_type,
+        "entity_type_counts_before_drop": type_counts_before_drop,
+        "entity_type_counts_after_drop": type_counts_after_drop,
+        "drop_most_common_circle_enabled": bool(
+            circle_plugin_result.get("enabled", False)
+        ),
+        "drop_most_common_circle_applied": bool(
+            circle_plugin_result.get("applied", False)
+        ),
+        "drop_most_common_circle_removed": int(
+            circle_plugin_result.get("removed_count", 0)
+        ),
+        "drop_most_common_circle_radius": circle_plugin_result.get("radius"),
+        "drop_most_common_circle_bucket_count": int(
+            circle_plugin_result.get("bucket_count", 0)
+        ),
+        "drop_most_common_circle_unique_radius_count": int(
+            circle_plugin_result.get("unique_radius_count", 0)
+        ),
+        "drop_most_common_circle_error": circle_plugin_result.get("error"),
         "dxf_entity_count": dxf_entity_count,
         "entity_count": len(cache_payload["fingerprints"]),
         "svg_render_time_ms": svg_render_time_ms,
         "cache_build_time_ms": cache_build_time_ms,
+        "insert_scanned": insert_scanned,
+        "insert_fixed": insert_fixed,
+        "insert_removed": render_retry_removed_inserts,
         "coord_basis": (
             "render_matrix"
             if render_mapping
