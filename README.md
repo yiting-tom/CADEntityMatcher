@@ -14,6 +14,7 @@
 - 單一實體與多實體匹配
 - 匹配分數（`match_score`）與門檻（`score_max`）
 - 掃描統計（`scan_stats`）
+- Upload 前處理插件（可插拔）
 
 ---
 
@@ -79,7 +80,10 @@ python app.py
 
 - FormData:
   - `file`: DXF 檔案
-  - `fast_build`: `true/false`
+  - `fast_build`: `true/false`（快取提速，略過 ELLIPSE/SPLINE）
+  - `drop_noisy_types`: `true/false`（是否啟用類型過濾）
+  - `drop_entity_types`: JSON array 或 CSV（要刪除的 DXF types）
+  - `drop_most_common_circle`: `true/false`（啟用「刪除最常見半徑 CIRCLE」插件）
 
 回傳重點欄位：
 
@@ -87,6 +91,9 @@ python app.py
 - `entity_count`
 - `svg_render_time_ms`
 - `cache_build_time_ms`
+- `entity_type_counts_before_drop` / `entity_type_counts_after_drop`
+- `drop_removed_count` / `drop_removed_by_type`
+- `drop_most_common_circle_removed` / `drop_most_common_circle_radius`
 
 ### `POST /extract`
 
@@ -179,6 +186,10 @@ python app.py
   - `COMPOSITE_SHAPE` 長寬比容差
 - `SINGLE_DIAG_TOL`
   - `COMPOSITE_SHAPE` 對角長容差
+- `SINGLE_EDGE_HIST_L1_TOL`
+  - `COMPOSITE_SHAPE` 邊長分佈直方圖容差（L1）
+- `SINGLE_TURN_HIST_L1_TOL`
+  - `COMPOSITE_SHAPE` 轉角分佈直方圖容差（L1）
 
 ---
 
@@ -224,6 +235,7 @@ python app.py
   - 過濾後數量
   - 匹配耗時
   - `score_reject_count`
+- 匹配去重使用內部穩定 key（優先 anchor-based），避免在密集區把相鄰真實結果誤合併
 
 ---
 

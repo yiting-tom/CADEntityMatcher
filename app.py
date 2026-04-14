@@ -1946,8 +1946,12 @@ def _build_match(
     match_score=None,
 ):
     """Shared match result builder. Anchor can be int(index) or dict(feature)."""
+    dedupe_key = None
     if isinstance(anchor_idx_or_feat, (int, np.integer)):
-        af = all_fp[int(anchor_idx_or_feat)]
+        anchor_idx = int(anchor_idx_or_feat)
+        af = all_fp[anchor_idx]
+        # Keep one result per anchor candidate to avoid merging nearby true matches.
+        dedupe_key = f"anchor:{anchor_idx}"
     else:
         af = anchor_idx_or_feat
     cx, cy = af["x"], af["y"]
@@ -1977,6 +1981,11 @@ def _build_match(
         "highlight_count_total": len(mf),
         "highlight_count_returned": len(hl),
         "highlight_truncated": len(hl) < len(mf),
+        "_dedupe_key": (
+            dedupe_key
+            if dedupe_key is not None
+            else f"xy:{round(float(mcx), 6)}:{round(float(mcy), 6)}"
+        ),
     }
 
 
@@ -1992,10 +2001,15 @@ def _trim_match_highlights(matches, max_with_highlights=MAX_SCAN_MATCHES_WITH_HI
 
 
 def _dedupe_and_sort_matches(matches):
-    """Deduplicate by rendered center; keep the lowest score, then sort by score."""
+    """Deduplicate by stable internal key; keep the lowest score, then sort by score."""
     best = {}
     for m in matches:
-        k = (m["render_pct_x"], m["render_pct_y"])
+        k = m.get("_dedupe_key")
+        if k is None:
+            k = (
+                round(float(m.get("dxf_x", 0.0)), 6),
+                round(float(m.get("dxf_y", 0.0)), 6),
+            )
         prev = best.get(k)
         ms = m.get("match_score")
         ps = None if prev is None else prev.get("match_score")
@@ -2003,6 +2017,8 @@ def _dedupe_and_sort_matches(matches):
             best[k] = m
     out = list(best.values())
     out.sort(key=lambda m: (m.get("match_score") is None, m.get("match_score", 1e9)))
+    for m in out:
+        m.pop("_dedupe_key", None)
     return out
 
 
