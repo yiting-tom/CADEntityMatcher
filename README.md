@@ -1,31 +1,32 @@
 # SMDR DXF Pattern Scanner
 
-`SMDR` 是一個以 FastAPI 實作的 DXF 圖樣搜尋工具。流程是：
+`SMDR` 是一個以 FastAPI 實作的 DXF 圖樣搜尋工具，主要流程如下：
 
-1. 上傳 DXF 並建立快取
-2. 在 SVG 上框選模板
-3. 以模板掃描整張圖，找出相似圖樣
+1. 上傳 DXF 並建立 session cache（`cache_id`）
+2. 在 SVG 預覽上框選模板（產生 `template_id`）
+3. 對整張圖掃描相似圖樣（`/scan` 或 `/scan_fast`）
 
-目前版本支援：
+本專案的目標是「在可接受速度下提高找樣準確度」，目前內建：
 
-- Session cache（`cache_id`）
-- 模板伺服器端儲存（`template_id`）
-- 標準掃描 `/scan` 與快速掃描 `/scan_fast`
+- Session cache（記憶體）
+- Template server-side storage（`template_id`）
 - 單一實體與多實體匹配
-- 匹配分數（`match_score`）與門檻（`score_max`）
-- 掃描統計（`scan_stats`）
-- Upload 前處理插件（可插拔）
+- 標準掃描 `/scan` 與快速掃描 `/scan_fast`
+- score-based matching（`match_score`, `score_max`）
+- 插件式過濾（單一實體匹配插件、upload 前處理插件）
+- Upload/Scan 統計資訊（方便調參）
 
 ---
 
-## 1. 環境需求
+## 1. Environment
 
 - Python 3.10+
 - 建議使用虛擬環境
+- 主要依賴：`fastapi`, `uvicorn`, `ezdxf`, `shapely`, `numpy`, `scipy`
 
 ---
 
-## 2. 安裝
+## 2. Installation
 
 ```bash
 python3 -m venv .venv
@@ -34,97 +35,148 @@ pip install -r requirements.txt
 pip install numpy scipy
 ```
 
-> `app.py` 會用到 `numpy` 與 `scipy`，請確認有安裝。
-
 ---
 
-## 3. 啟動服務
+## 3. Run
 
 ```bash
 python app.py
 ```
 
-預設啟動在：
+預設網址：
 
 - `http://127.0.0.1:8000`
 
 ---
 
-## 4. Web UI 使用流程
+## 4. Web UI Quickstart
 
-打開首頁後照 3 個步驟操作：
+### Step 1: Upload DXF File
 
-1. **Upload DXF File**
-- 選擇 `.dxf`
-- 可選 `Fast Cache Build (skip ELLIPSE/SPLINE)`
+- 選擇 `.dxf` 檔
+- 可選參數：
+  - `Fast Cache Build (skip ELLIPSE/SPLINE)`：建 cache 更快，特徵較粗
+  - `Enable Entity Type Filtering`：刪掉干擾 type（如文字、標註）
+  - `Plugin: Drop Most Common CIRCLE Size`：刪除數量最多同半徑 `CIRCLE`
 - 點擊 `Upload & Render SVG`
 
-2. **Select Feature (Polygon)**
-- 左鍵逐點框選
-- 雙擊或點回起點閉合
-- 右鍵拖曳平移，滾輪縮放
-- 系統會產生 `template_id`
+Upload Stats 會顯示：
 
-3. **Full Scan (Analyzer)**
-- 選 `Standard Scan` 或 `Fast Scan (KD-Tree)`
-- 點 `Start Pattern Matching`
-- 可下載 fingerprint 與 match results
+- entity 總數
+- type 統計（before/after drop）
+- drop 詳細資訊
+- plugin 刪除數量與半徑
+- SVG render 時間 / cache 建立時間
+
+### Step 2: Select Feature (Polygon)
+
+- 左鍵：逐點框選
+- 雙擊或點回第一點：閉合
+- 右鍵拖曳：平移
+- 滾輪：縮放
+- `ESC`：清除框選
+- `Download Fingerprint`：下載模板 JSON
+
+### Step 3: Full Scan (Analyzer)
+
+- 選擇：`Standard Scan` 或 `Fast Scan (KD-Tree)`
+- 點擊 `Start Pattern Matching`
+- 結果包含：
+  - `match_count`
+  - `matches[]`
+  - `scan_stats`
+- `Download Match Results` 可下載完整結果 JSON
 
 ---
 
-## 5. 核心 API
+## 5. API Overview
 
-### `POST /upload`
+## `POST /upload`
 
-上傳 DXF，回傳 `cache_id` 與 SVG。
+上傳 DXF、執行前處理、建立 cache、回傳 SVG。
 
-- FormData:
-  - `file`: DXF 檔案
-  - `fast_build`: `true/false`（快取提速，略過 ELLIPSE/SPLINE）
-  - `drop_noisy_types`: `true/false`（是否啟用類型過濾）
-  - `drop_entity_types`: JSON array 或 CSV（要刪除的 DXF types）
-  - `drop_most_common_circle`: `true/false`（啟用「刪除最常見半徑 CIRCLE」插件）
+### Request (`multipart/form-data`)
 
-回傳重點欄位：
+- `file`（required）: DXF 檔案
+- `fast_build`（optional, bool）
+- `drop_noisy_types`（optional, bool）
+- `drop_entity_types`（optional, JSON array 或 CSV）
+- `drop_most_common_circle`（optional, bool）
 
-- `cache_id`
-- `entity_count`
-- `svg_render_time_ms`
-- `cache_build_time_ms`
-- `entity_type_counts_before_drop` / `entity_type_counts_after_drop`
-- `drop_removed_count` / `drop_removed_by_type`
-- `drop_most_common_circle_removed` / `drop_most_common_circle_radius`
+### Response fields (主要)
 
-### `POST /extract`
+- `cache_id`: 本次上傳快取 ID
+- `entity_count`: 建立 fingerprint 後的特徵數
+- `dxf_entity_count`: modelspace entity 數
+- `entity_type_counts_before_drop`: 過濾前 type 統計
+- `entity_type_counts_after_drop`: 過濾後 type 統計
+- `drop_removed_count`: type 過濾刪除數
+- `drop_removed_by_type`: type 過濾明細
+- `drop_most_common_circle_removed`: circle plugin 刪除數
+- `drop_most_common_circle_radius`: 被刪除的目標半徑
+- `insert_scanned` / `insert_fixed` / `insert_removed`: INSERT 修復與移除統計
+- `svg_render_time_ms`: SVG 渲染時間
+- `cache_build_time_ms`: cache 建立時間
+- `coord_basis`: 座標映射依據（`render_matrix` / `render_bbox` / `dxf_extents`）
+- `svg`: SVG 字串
 
-從框選多邊形擷取模板。
+### cURL example
 
-請求範例：
+```bash
+curl -X POST http://127.0.0.1:8000/upload \
+  -F "file=@demo.dxf" \
+  -F "fast_build=false" \
+  -F "drop_noisy_types=true" \
+  -F 'drop_entity_types=["TEXT","MTEXT","DIMENSION"]' \
+  -F "drop_most_common_circle=true"
+```
+
+---
+
+## `POST /extract`
+
+依框選多邊形從 cache 中擷取模板。
+
+### Request JSON
 
 ```json
 {
   "cache_id": "<cache_id>",
-  "polygon_pct": [[0.1,0.2],[0.2,0.2],[0.2,0.3],[0.1,0.3]]
+  "polygon_pct": [[0.1, 0.2], [0.2, 0.2], [0.2, 0.3], [0.1, 0.3]]
 }
 ```
 
-回傳重點欄位：
+### Response fields (主要)
 
-- `template_id`
-- `group_center`
-- `entity_count`
-- `entities_preview`
+- `template_id`: 模板 ID
+- `group_center`: 模板中心（DXF 座標）
+- `entity_count`: 擷取到的特徵數
+- `entities_preview`: 模板預覽（截斷）
+- `highlights`: 供前端畫框線的幾何
 - `highlight_count_total` / `highlight_count_returned`
 
-### `POST /template`
+---
 
-用 `cache_id + template_id` 取回完整模板。
+## `POST /template`
 
-### `POST /scan`、`POST /scan_fast`
+用 `cache_id + template_id` 取回模板完整內容。
 
-以模板掃描整張 DXF。
+### Request JSON
 
-請求建議（template_id 模式）：
+```json
+{
+  "cache_id": "<cache_id>",
+  "template_id": "<template_id>"
+}
+```
+
+---
+
+## `POST /scan` / `POST /scan_fast`
+
+以模板掃描整張 DXF。`scan_fast` 在大圖通常更快。
+
+### 建議 Request（template_id 模式）
 
 ```json
 {
@@ -134,121 +186,227 @@ python app.py
 }
 ```
 
-也支援直接傳完整模板（不建議，payload 較大）：
+### 或直接送模板（不建議）
 
 ```json
 {
   "cache_id": "<cache_id>",
   "group_center": {"x": 10.0, "y": 20.0},
-  "entities": [...]
+  "entities": [
+    {"type": "COMPOSITE_SHAPE", "size": 2.036, "x": 4.239, "y": -1.401}
+  ],
+  "score_max": 0.35
 }
 ```
 
-回傳重點欄位：
+### Response fields (主要)
 
 - `match_count`
 - `matches[]`
   - `dxf_x`, `dxf_y`
+  - `render_pct_x`, `render_pct_y`
   - `match_score`（越小越好）
   - `highlights`
+  - `highlight_count_total`, `highlight_count_returned`
 - `scan_stats`
 
 ---
 
-## 6. 參數功能總覽
+## 6. Key Parameters
 
-### API 請求參數
+### Upload related
 
-- `cache_id`
-  - 來源：`/upload`
-  - 作用：指定要使用哪次上傳建立的快取
-- `template_id`
-  - 來源：`/extract`
-  - 作用：指定要使用哪個模板掃描
-- `polygon_pct`
-  - 作用：框選多邊形，座標採 0~1 百分比（相對 SVG）
 - `fast_build`
-  - `true`：建 cache 較快（略過 ELLIPSE/SPLINE）
-  - `false`：建 cache 較完整
+  - `true`: 建 cache 快，會略過 `ELLIPSE/SPLINE`
+  - `false`: 建 cache 慢一些，但特徵更完整
+
+- `drop_noisy_types`
+  - 啟用類型刪除
+
+- `drop_entity_types`
+  - 自訂要刪除的 DXF type（JSON array 或 CSV）
+  - 若未提供，使用內建預設：
+    - `TEXT, MTEXT, DIMENSION, LEADER, MLEADER, HATCH, IMAGE, WIPEOUT, POINT, XLINE, RAY`
+
+- `drop_most_common_circle`
+  - 啟用 upload plugin：刪除「數量最多且同半徑」的 circles
+
+### Scan related
+
 - `score_max`
-  - 作用：匹配分數上限，超過即剔除
-  - 範圍：`0.0 ~ 1.0`（越小越嚴格）
-
-### 內部可調常數（`app.py`）
-
-- `SIZE_TOL_RATIO`, `SIZE_TOL_MIN`
-  - 控制尺寸匹配容差
-- `DIST_TOL_RATIO`, `DIST_TOL_MIN`
-  - 控制模板內相對距離容差
-- `SINGLE_POINT_COUNT_TOL`
-  - `COMPOSITE_SHAPE` 點數容差
-- `SINGLE_ASPECT_RATIO_TOL`
-  - `COMPOSITE_SHAPE` 長寬比容差
-- `SINGLE_DIAG_TOL`
-  - `COMPOSITE_SHAPE` 對角長容差
-- `SINGLE_EDGE_HIST_L1_TOL`
-  - `COMPOSITE_SHAPE` 邊長分佈直方圖容差（L1）
-- `SINGLE_TURN_HIST_L1_TOL`
-  - `COMPOSITE_SHAPE` 轉角分佈直方圖容差（L1）
+  - 最終匹配分數上限（`0.0 ~ 1.0`）
+  - 越小越嚴格，誤報少但可能漏報
 
 ---
 
-## 7. `score_max` 調參建議
+## 7. Matching Logic (簡化版)
 
-`score_max` 預設是 `0.4`，範圍 `0.0 ~ 1.0`。
+1. 特徵抽取：`CIRCLE` + 線段合併後的 `COMPOSITE_SHAPE`
+2. 選擇 anchor（稀有優先）
+3. 根據 type/size/distance 找候選
+4. 進行 bipartite matching（`linear_sum_assignment`）
+5. 計算 `match_score`，超過 `score_max` 剔除
+6. 去重 + 排序後回傳
 
-- 誤報太多：調小，例如 `0.2`、`0.1`
-- 漏報太多：調大，例如 `0.5`
+### Single-entity mode
 
-一般建議：
-
-- 高精準搜尋：`0.1 ~ 0.25`
-- 平衡模式：`0.25 ~ 0.4`
-
----
-
-## 8. `scan_stats` 欄位解讀
-
-- `candidate_anchor_base`
-  - 初始候選數（只看 type/size）
-- `candidate_anchor_after_plugin`
-  - plugin（含 shape signature）過濾後候選數
-- `score_reject_count`
-  - 被 `score_max` 淘汰的匹配數
-- `prefilter_ms`
-  - 前置過濾耗時
-- `matching_ms`
-  - 匹配主流程耗時
-- `elapsed_ms`
-  - 掃描總耗時
-- `avg_neighbors_per_anchor`
-  - 每個 anchor 探索的平均鄰居數
+若模板只有 1 個 entity，直接做 type/size + plugin 過濾，不跑完整圖 matching。
 
 ---
 
-## 9. 效能與穩定性說明
+## 8. Built-in Plugins
 
-- 快取是記憶體 Session cache（非永久）
-- 前端有高亮繪製上限，避免大量 SVG 導致卡頓
-- `scan_stats` 可用來觀察：
-  - 候選數量
-  - 過濾後數量
-  - 匹配耗時
-  - `score_reject_count`
-- 匹配去重使用內部穩定 key（優先 anchor-based），避免在密集區把相鄰真實結果誤合併
+## Single Entity Matching Plugins
+
+目前內建兩個 `COMPOSITE_SHAPE` 插件：
+
+1. Signature plugin
+- 檢查：`point_count`, `aspect_ratio`, `bbox_diag`
+
+2. Histogram plugin
+- 檢查：`edge_hist`（邊長分佈）
+- 檢查：`turn_hist`（轉角分佈）
+- 用 L1 距離閾值過濾
+
+## Upload Doc Plugin
+
+目前內建：`drop_most_common_circle_size`
+
+- 目標：刪掉同半徑且數量最多的 circles
+- 用途：去掉密集重複圓孔、標記圓等高干擾元素
 
 ---
 
-## 10. 常見問題
+## 9. Internal Tunables (`app.py`)
 
-### 為什麼有 `cache_id` 失效？
+常用可調常數：
 
-快取是暫存，過期或重啟後需重新上傳 DXF。
+- 尺寸與距離容差
+  - `SIZE_TOL_RATIO`, `SIZE_TOL_MIN`
+  - `DIST_TOL_RATIO`, `DIST_TOL_MIN`
 
-### `scan` 和 `scan_fast` 結果要一樣嗎？
+- COMPOSITE_SHAPE 簽名容差
+  - `SINGLE_POINT_COUNT_TOL`
+  - `SINGLE_ASPECT_RATIO_TOL`
+  - `SINGLE_DIAG_TOL`
 
-理論上應一致；`scan_fast` 主要優化速度。
+- Histogram 容差
+  - `SINGLE_EDGE_HIST_L1_TOL`
+  - `SINGLE_TURN_HIST_L1_TOL`
 
-### 匹配結果太多怎麼辦？
+- Upload circle plugin
+  - `CIRCLE_MODE_RADIUS_DECIMALS`
+  - `CIRCLE_MODE_MIN_GROUP_COUNT`
 
-先調小 `score_max`，再縮小模板框選範圍。
+- Highlight/回傳上限（避免前端 freeze）
+  - `MAX_SCAN_HIGHLIGHTS_RETURN`
+  - `MAX_SCAN_MATCHES_WITH_HIGHLIGHTS`
+  - `MAX_EXTRACT_HIGHLIGHTS_RETURN`
+
+---
+
+## 10. Tuning Guide (速度 vs 準確度)
+
+如果誤抓很多：
+
+1. 降低 `score_max`（例如 `0.4 -> 0.25`）
+2. 開啟 `drop_noisy_types`
+3. 開啟 `drop_most_common_circle`
+4. 選更小、更具代表性的模板區域
+
+如果漏抓很多：
+
+1. 提高 `score_max`（例如 `0.25 -> 0.4`）
+2. 關閉部分 aggressive 過濾
+3. 用 `fast_build=false` 建更完整 cache
+
+如果很慢：
+
+1. 改用 `/scan_fast`
+2. 開啟 `fast_build`
+3. 縮小模板（減少 entity 數）
+
+---
+
+## 11. Troubleshooting
+
+### A. 框到了但 `entities: []`
+
+可能原因：
+
+- 框選區域內沒有 feature centroid
+- 當前模板太小或太偏邊界
+- 座標映射 fallback 到 `dxf_extents`（精度較差）
+
+建議：
+
+- 重新框稍大範圍
+- 看 upload stats 的 `coord_basis`，盡量是 `render_matrix`
+
+### B. `scan_fast` 找不到結果
+
+可能原因：
+
+- 模板被抽成單一 `COMPOSITE_SHAPE`，條件太嚴
+- `score_max` 太小
+- upload 過濾把關鍵 entity 刪掉
+
+建議：
+
+- 提高 `score_max`
+- 先關閉部分過濾
+- 改用 `Standard Scan` 比對行為
+
+### C. DWG 轉 DXF 後 render/選取異常
+
+本專案已做：
+
+- INSERT transform sanitize
+- render 失敗時移除不可展開 INSERT 後重試
+- extract 優先使用 inverse render matrix 映射
+
+若仍有問題，請先用 upload stats 檢查：
+
+- `insert_fixed`
+- `insert_removed`
+- `coord_basis`
+
+### D. 網頁卡頓或高亮太多
+
+- 已有 highlight 回傳與繪製上限
+- 請縮小模板或降低 `score_max`
+
+---
+
+## 12. Cache / Session Behavior
+
+- cache 存在記憶體，不是永久儲存
+- `cache_id` 可能因 TTL/容量淘汰失效
+- 服務重啟後 cache 全部失效
+
+---
+
+## 13. Developer Notes
+
+### 建議分支策略
+
+- 每個改進開新 branch
+- 一個功能一個 commit（或小批次）
+
+### 推薦驗證
+
+```bash
+python -m py_compile app.py
+```
+
+若有測試檔案，建議再補：
+
+- `/upload` 回傳欄位完整性
+- `/extract` 座標映射一致性
+- `/scan` 與 `/scan_fast` 結果一致性（允許排序差異）
+
+---
+
+## 14. License
+
+目前未附授權條款，若要公開發佈請補上 `LICENSE`。
