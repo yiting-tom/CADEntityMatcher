@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from typing import Callable
 import numpy as np
 from scipy.spatial import cKDTree
@@ -16,6 +17,7 @@ from ezdxf.bbox import extents
 from ezdxf.addons.drawing import Frontend, RenderContext, layout
 from ezdxf.addons.drawing.config import Configuration
 from ezdxf.addons.drawing.svg import SVGBackend
+from ezdxf.math import Matrix44
 from shapely.geometry import Point, LineString, Polygon as ShapelyPolygon
 from shapely.ops import linemerge
 
@@ -47,6 +49,8 @@ MATCH_SCORE_ANCHOR_WEIGHT = 0.30
 MATCH_SCORE_SIZE_WEIGHT = 0.45
 MATCH_SCORE_DIST_WEIGHT = 0.45
 MATCH_SCORE_SHAPE_WEIGHT = 0.10
+BOUNDS_EPS = 1e-9
+MAX_INSERT_EXPLODE_DEPTH = 8
 
 
 def snap(val):
@@ -111,17 +115,48 @@ def _compact_render_highlight(h):
     return compact
 
 
+def _make_bounds(min_x, min_y, max_x, max_y):
+    width = max(float(max_x) - float(min_x), BOUNDS_EPS)
+    height = max(float(max_y) - float(min_y), BOUNDS_EPS)
+    return {
+        "min_x": float(min_x),
+        "min_y": float(min_y),
+        "max_x": float(max_x),
+        "max_y": float(max_y),
+        "width": width,
+        "height": height,
+    }
+
+
+def _bbox2d_to_bounds(bbox2d):
+    """Convert ezdxf BoundingBox2d to internal bounds dict."""
+    min_x, min_y = bbox2d.extmin
+    max_x, max_y = bbox2d.extmax
+    return _make_bounds(min_x, min_y, max_x, max_y)
+
+
 def get_dxf_bounds(msp):
     """Get DXF extents and dimensions."""
     ext = extents(msp)
-    return {
-        "min_x": ext.extmin.x,
-        "min_y": ext.extmin.y,
-        "max_x": ext.extmax.x,
-        "max_y": ext.extmax.y,
-        "width": ext.extmax.x - ext.extmin.x,
-        "height": ext.extmax.y - ext.extmin.y,
-    }
+    return _make_bounds(ext.extmin.x, ext.extmin.y, ext.extmax.x, ext.extmax.y)
+
+
+def _iter_flat_entities(entities, *, depth=0, max_depth=MAX_INSERT_EXPLODE_DEPTH):
+    """Yield entities with INSERT exploded to virtual entities recursively."""
+    if depth > max_depth:
+        return
+    for entity in entities:
+        if entity.dxftype() == "INSERT":
+            if depth >= max_depth:
+                continue
+            try:
+                yield from _iter_flat_entities(
+                    entity.virtual_entities(), depth=depth + 1, max_depth=max_depth
+                )
+            except Exception:
+                continue
+            continue
+        yield entity
 
 
 def _polyline_shape_signature(points):
@@ -148,13 +183,14 @@ def extract_template_features(
     Smart feature extraction v2:
     1. Always run global linemerge on the whole drawing for topology consistency.
     2. Supports CIRCLE, LINE, LWPOLYLINE, ARC, POLYLINE, ELLIPSE, SPLINE.
-    3. Snap endpoints to improve linemerge stability.
-    4. Apply ROI filtering last (centroid must be inside ROI).
+    3. Expands INSERT (block references) recursively via virtual_entities().
+    4. Snap endpoints to improve linemerge stability.
+    5. Apply ROI filtering last (centroid must be inside ROI).
     """
     circles = []
     all_lines = []
 
-    for entity in msp:
+    for entity in _iter_flat_entities(msp):
         etype = entity.dxftype()
 
         if etype == "CIRCLE":
@@ -269,9 +305,11 @@ _cache_store = {}
 _cache_lock = threading.Lock()
 
 
-def _build_cache_payload(msp, *, fast_build=False):
+def _build_cache_payload(
+    msp, *, fast_build=False, bounds_override=None, render_mapping=None
+):
     """Build cache payload (fingerprints + spatial indexes) for one upload."""
-    bounds = get_dxf_bounds(msp)
+    bounds = bounds_override or get_dxf_bounds(msp)
     flatten_tol = FAST_FLATTEN_TOL if fast_build else DEFAULT_FLATTEN_TOL
     fingerprints = extract_template_features(
         msp,
@@ -305,6 +343,7 @@ def _build_cache_payload(msp, *, fast_build=False):
         "tree": tree,
         "type_index": type_index,
         "templates": {},
+        "render_mapping": render_mapping,
         "fast_build": fast_build,
         "flatten_tol": flatten_tol,
         "created_at": now,
@@ -885,6 +924,7 @@ html_content = """
                     var lines = [
                         "Upload successful (" + mode + " build).",
                         "Entity count: " + (data.entity_count ?? 0),
+                        "Coordinate basis: " + (data.coord_basis || "dxf_extents"),
                         "SVG render time: " + (data.svg_render_time_ms ?? 0) + " ms",
                         "Cache build time: " + (data.cache_build_time_ms ?? 0) + " ms",
                     ];
@@ -1234,12 +1274,43 @@ async def upload_dxf(
 
     t0 = time.perf_counter()
     Frontend(RenderContext(doc), backend, config=render_config).draw_layout(msp)
+    render_bounds = None
+    render_mapping = None
+    try:
+        player_bbox = backend.player().bbox()
+        if player_bbox.has_data:
+            render_bounds = _bbox2d_to_bounds(player_bbox)
+    except Exception:
+        render_bounds = None
     page = layout.Page(0, 0, layout.Units.mm)
     svg = backend.get_string(page)
+    try:
+        inv = backend.transformation_matrix.copy()
+        inv.inverse()
+        rows = list(inv.rows())
+        inv_flat = [float(v) for row in rows for v in row]
+        root = ET.fromstring(svg)
+        vb = (root.get("viewBox") or "").strip().split()
+        if len(vb) == 4:
+            viewbox_w = float(vb[2])
+            viewbox_h = float(vb[3])
+            if viewbox_w > 0 and viewbox_h > 0:
+                render_mapping = {
+                    "inv_matrix": inv_flat,
+                    "viewbox_w": viewbox_w,
+                    "viewbox_h": viewbox_h,
+                }
+    except Exception:
+        render_mapping = None
     svg_render_time_ms = int((time.perf_counter() - t0) * 1000)
 
     t1 = time.perf_counter()
-    cache_payload = _build_cache_payload(msp, fast_build=fast_build)
+    cache_payload = _build_cache_payload(
+        msp,
+        fast_build=fast_build,
+        bounds_override=render_bounds,
+        render_mapping=render_mapping,
+    )
     cache_build_time_ms = int((time.perf_counter() - t1) * 1000)
     cache_id = _store_cache(cache_payload)
     return {
@@ -1250,6 +1321,11 @@ async def upload_dxf(
         "entity_count": len(cache_payload["fingerprints"]),
         "svg_render_time_ms": svg_render_time_ms,
         "cache_build_time_ms": cache_build_time_ms,
+        "coord_basis": (
+            "render_matrix"
+            if render_mapping
+            else ("render_bbox" if render_bounds else "dxf_extents")
+        ),
         "svg": svg,
     }
 
@@ -1270,14 +1346,34 @@ async def extract_template(data: dict = Body(...)):
 
     bounds = cache_payload["bounds"]
 
-    # Convert percentage vertices to DXF coordinates
-    dxf_vertices = [
-        (
-            bounds["min_x"] + pt[0] * bounds["width"],
-            bounds["max_y"] - pt[1] * bounds["height"],
-        )
-        for pt in polygon_pct
-    ]
+    # Convert percentage vertices to DXF coordinates.
+    # Preferred: exact inverse render matrix (robust for transformed/converted DXF).
+    dxf_vertices = []
+    render_mapping = cache_payload.get("render_mapping") or {}
+    inv_flat = render_mapping.get("inv_matrix")
+    viewbox_w = render_mapping.get("viewbox_w")
+    viewbox_h = render_mapping.get("viewbox_h")
+    if inv_flat and viewbox_w and viewbox_h:
+        try:
+            inv = Matrix44(inv_flat)
+            dxf_vertices = []
+            for pt in polygon_pct:
+                x_vb = float(pt[0]) * float(viewbox_w)
+                y_vb = float(pt[1]) * float(viewbox_h)
+                p = inv.transform((x_vb, y_vb, 0.0))
+                dxf_vertices.append((float(p[0]), float(p[1])))
+        except Exception:
+            dxf_vertices = []
+
+    if not dxf_vertices:
+        # Fallback: linear bounds mapping.
+        dxf_vertices = [
+            (
+                bounds["min_x"] + pt[0] * bounds["width"],
+                bounds["max_y"] - pt[1] * bounds["height"],
+            )
+            for pt in polygon_pct
+        ]
     roi_polygon = ShapelyPolygon(dxf_vertices)
 
     # Filter directly from cache (no linemerge recomputation)
