@@ -1,6 +1,6 @@
-fastapi
-uvicorn
+PySide6
 ezdxf
+numpy
+scipy
 shapely
-python-multipart
-pillow
+pytest
