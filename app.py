@@ -38,6 +38,10 @@ MAX_CACHE_SESSIONS = 32
 SINGLE_POINT_COUNT_TOL = 2
 SINGLE_ASPECT_RATIO_TOL = 0.20  # 20%
 SINGLE_DIAG_TOL = 0.10  # 10%
+SINGLE_EDGE_HIST_BINS = 8
+SINGLE_TURN_HIST_BINS = 12
+SINGLE_EDGE_HIST_L1_TOL = 0.55
+SINGLE_TURN_HIST_L1_TOL = 0.60
 DEFAULT_FLATTEN_TOL = 0.01
 FAST_FLATTEN_TOL = 0.08
 MAX_EXTRACT_HIGHLIGHTS_RETURN = 250
@@ -319,17 +323,68 @@ def _drop_unrenderable_inserts(doc):
 def _polyline_shape_signature(points):
     """Build an orientation-agnostic shape signature for polyline matching."""
     if not points:
-        return {"point_count": 0, "bbox_diag": 0.0, "aspect_ratio": 1.0}
+        return {
+            "point_count": 0,
+            "bbox_diag": 0.0,
+            "aspect_ratio": 1.0,
+            "edge_hist": [0.0] * SINGLE_EDGE_HIST_BINS,
+            "turn_hist": [0.0] * SINGLE_TURN_HIST_BINS,
+        }
     xs = [p[0] for p in points]
     ys = [p[1] for p in points]
     w = max(xs) - min(xs)
     h = max(ys) - min(ys)
     long_side = max(w, h)
     short_side = max(min(w, h), 1e-9)
+    seg_norm = []
+    turn_angles = []
+    seg_lengths = []
+    for i in range(len(points) - 1):
+        dx = points[i + 1][0] - points[i][0]
+        dy = points[i + 1][1] - points[i][1]
+        l = math.hypot(dx, dy)
+        if l > BOUNDS_EPS:
+            seg_lengths.append(l)
+    total_len = sum(seg_lengths)
+    if total_len > BOUNDS_EPS:
+        seg_norm = [l / total_len for l in seg_lengths]
+    for i in range(1, len(points) - 1):
+        ax = points[i][0] - points[i - 1][0]
+        ay = points[i][1] - points[i - 1][1]
+        bx = points[i + 1][0] - points[i][0]
+        by = points[i + 1][1] - points[i][1]
+        la = math.hypot(ax, ay)
+        lb = math.hypot(bx, by)
+        if la <= BOUNDS_EPS or lb <= BOUNDS_EPS:
+            continue
+        cosv = max(-1.0, min(1.0, (ax * bx + ay * by) / (la * lb)))
+        turn_angles.append(math.acos(cosv))
+    if seg_norm:
+        edge_hist = (
+            np.histogram(seg_norm, bins=SINGLE_EDGE_HIST_BINS, range=(0.0, 1.0))[0]
+            .astype(np.float64)
+            .tolist()
+        )
+        edge_sum = sum(edge_hist) or 1.0
+        edge_hist = [round(v / edge_sum, 6) for v in edge_hist]
+    else:
+        edge_hist = [0.0] * SINGLE_EDGE_HIST_BINS
+    if turn_angles:
+        turn_hist = (
+            np.histogram(turn_angles, bins=SINGLE_TURN_HIST_BINS, range=(0.0, math.pi))[0]
+            .astype(np.float64)
+            .tolist()
+        )
+        turn_sum = sum(turn_hist) or 1.0
+        turn_hist = [round(v / turn_sum, 6) for v in turn_hist]
+    else:
+        turn_hist = [0.0] * SINGLE_TURN_HIST_BINS
     return {
         "point_count": int(len(points)),
         "bbox_diag": round(math.hypot(w, h), 6),
         "aspect_ratio": round(long_side / short_side, 6),
+        "edge_hist": edge_hist,
+        "turn_hist": turn_hist,
     }
 
 
@@ -758,6 +813,36 @@ def _plugin_composite_shape_signature(template_entity, candidate_feature):
     return True
 
 
+def _hist_l1_distance(a, b):
+    if not isinstance(a, list) or not isinstance(b, list):
+        return None
+    if len(a) == 0 or len(a) != len(b):
+        return None
+    try:
+        return float(sum(abs(float(x) - float(y)) for x, y in zip(a, b)))
+    except Exception:
+        return None
+
+
+def _plugin_composite_shape_histogram(template_entity, candidate_feature):
+    """Filter COMPOSITE_SHAPE candidates by edge/turn histogram similarity."""
+    if template_entity.get("type") != "COMPOSITE_SHAPE":
+        return True
+    ts = template_entity.get("shape_sig")
+    cs = candidate_feature.get("shape_sig")
+    if not isinstance(ts, dict) or not isinstance(cs, dict):
+        return True
+
+    edge_l1 = _hist_l1_distance(ts.get("edge_hist"), cs.get("edge_hist"))
+    if edge_l1 is not None and edge_l1 > SINGLE_EDGE_HIST_L1_TOL:
+        return False
+
+    turn_l1 = _hist_l1_distance(ts.get("turn_hist"), cs.get("turn_hist"))
+    if turn_l1 is not None and turn_l1 > SINGLE_TURN_HIST_L1_TOL:
+        return False
+    return True
+
+
 def _single_entity_plugin_pass(template_entity, candidate_feature):
     for plugin in SINGLE_ENTITY_MATCH_PLUGINS:
         if not plugin(template_entity, candidate_feature):
@@ -796,6 +881,14 @@ def _shape_signature_error(template_entity, candidate_feature):
     if isinstance(td, (int, float)) and isinstance(cd, (int, float)) and td > 0:
         rel = abs(cd - td) / td
         parts.append(_clamp01(rel / SINGLE_DIAG_TOL))
+
+    edge_l1 = _hist_l1_distance(ts.get("edge_hist"), cs.get("edge_hist"))
+    if edge_l1 is not None:
+        parts.append(_clamp01(edge_l1 / SINGLE_EDGE_HIST_L1_TOL))
+
+    turn_l1 = _hist_l1_distance(ts.get("turn_hist"), cs.get("turn_hist"))
+    if turn_l1 is not None:
+        parts.append(_clamp01(turn_l1 / SINGLE_TURN_HIST_L1_TOL))
 
     if not parts:
         return 0.0
@@ -886,6 +979,7 @@ def _best_scored_matching(adj_scored):
 
 
 register_single_entity_plugin(_plugin_composite_shape_signature)
+register_single_entity_plugin(_plugin_composite_shape_histogram)
 register_upload_doc_plugin(
     "drop_most_common_circle_size", _plugin_drop_most_common_circle_size
 )
