@@ -1,0 +1,1436 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>DXF CAD Pattern Scanner</title>
+    <style>
+        html,
+        body {
+            margin: 0;
+            height: 100%;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: "Segoe UI", sans-serif;
+            background: #000;
+            color: #d9e2ec;
+            overflow: hidden;
+        }
+
+        .app-shell {
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .topbar {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 14px 18px;
+            border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+            background: rgba(15, 23, 32, 0.92);
+        }
+
+        .brand {
+            min-width: 220px;
+        }
+
+        .brand h1 {
+            margin: 0;
+            font-size: 16px;
+            font-weight: 600;
+            letter-spacing: 0.02em;
+        }
+
+        .brand p {
+            margin: 4px 0 0;
+            font-size: 12px;
+            color: #8aa0b6;
+        }
+
+        .toolbar {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+            flex: 1;
+        }
+
+        .toolbar-group {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 10px;
+            border-radius: 12px;
+            background: rgba(148, 163, 184, 0.08);
+        }
+
+        .toolbar label,
+        .toolbar span {
+            font-size: 12px;
+            color: #9fb3c8;
+        }
+
+        input[type="file"] {
+            max-width: 220px;
+            font-size: 12px;
+            color: #cfe0f1;
+        }
+
+        input[type="file"]::file-selector-button {
+            margin-right: 10px;
+            border: 1px solid rgba(148, 163, 184, 0.24);
+            border-radius: 8px;
+            padding: 8px 10px;
+            background: #182330;
+            color: #d9e2ec;
+            cursor: pointer;
+        }
+
+        input[type="radio"],
+        input[type="checkbox"] {
+            accent-color: #4da3ff;
+        }
+
+        .viewer-shell {
+            position: relative;
+            flex: 1;
+            min-height: 0;
+            background: #000;
+        }
+
+        #canvas-container {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            cursor: crosshair;
+            overflow: hidden;
+        }
+
+        #transform-wrapper {
+            transform-origin: 0 0;
+            position: relative;
+            width: 100%;
+            height: 100%;
+        }
+
+        #svg-display {
+            width: 100%;
+            height: 100%;
+            display: block;
+            background: #000;
+        }
+
+        #svg-display svg {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+
+        button {
+            padding: 9px 12px;
+            cursor: pointer;
+            background: #2684ff;
+            color: white;
+            border: none;
+            border-radius: 9px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        button:hover {
+            background: #1769d8;
+        }
+
+        button:disabled {
+            background: #66788a;
+            cursor: not-allowed;
+        }
+
+        .btn-sm {
+            padding: 8px 10px;
+            background: #425466;
+        }
+
+        .btn-sm:hover {
+            background: #334556;
+        }
+
+        .btn-danger {
+            background: #c23b3b;
+        }
+
+        .btn-danger:hover {
+            background: #a72f2f;
+        }
+
+        pre {
+            margin: 0;
+            background: #0f1720;
+            color: #d9e2ec;
+            padding: 10px 12px;
+            border-radius: 10px;
+            overflow-x: auto;
+            max-height: 220px;
+            font-size: 12px;
+            line-height: 1.45;
+            border: 1px solid rgba(148, 163, 184, 0.14);
+        }
+
+        .hint {
+            color: #9fb3c8;
+            font-size: 12px;
+            margin: 0;
+        }
+
+        .floating-hint {
+            position: absolute;
+            left: 18px;
+            bottom: 18px;
+            padding: 12px 14px;
+            border-radius: 12px;
+            background: rgba(15, 23, 32, 0.82);
+            border: 1px solid rgba(148, 163, 184, 0.16);
+            backdrop-filter: blur(12px);
+            max-width: 360px;
+            z-index: 20;
+        }
+
+        .sidepanel {
+            position: absolute;
+            top: 18px;
+            right: 18px;
+            width: min(360px, calc(100vw - 36px));
+            max-height: calc(100vh - 112px);
+            overflow: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            z-index: 20;
+        }
+
+        .status-card {
+            border-radius: 14px;
+            padding: 14px;
+            background: rgba(15, 23, 32, 0.82);
+            border: 1px solid rgba(148, 163, 184, 0.16);
+            backdrop-filter: blur(12px);
+        }
+
+        .status-card h2,
+        .status-card h3 {
+            margin: 0 0 10px;
+            font-size: 13px;
+            font-weight: 600;
+            color: #f4f7fb;
+        }
+
+        .status-line {
+            min-height: 18px;
+            margin: 0 0 10px;
+            font-size: 12px;
+            color: #7dd3a7;
+        }
+
+        details {
+            border-radius: 12px;
+            background: rgba(148, 163, 184, 0.06);
+            border: 1px solid rgba(148, 163, 184, 0.12);
+            overflow: hidden;
+        }
+
+        details[open] {
+            background: rgba(148, 163, 184, 0.09);
+        }
+
+        summary {
+            list-style: none;
+            cursor: pointer;
+            padding: 12px 14px;
+            font-size: 12px;
+            font-weight: 600;
+            color: #d9e2ec;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        summary::-webkit-details-marker {
+            display: none;
+        }
+
+        summary::after {
+            content: "▾";
+            font-size: 12px;
+            color: #8aa0b6;
+            transition: transform 0.18s ease;
+        }
+
+        details:not([open]) summary::after {
+            transform: rotate(-90deg);
+        }
+
+        .details-body {
+            padding: 0 12px 12px;
+        }
+
+        .settings-stack {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .settings-subtitle {
+            margin: 0;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+            color: #8aa0b6;
+        }
+
+        .setting-item {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            padding: 8px 10px;
+            border-radius: 10px;
+            background: rgba(148, 163, 184, 0.05);
+            border: 1px solid rgba(148, 163, 184, 0.08);
+        }
+
+        .setting-title {
+            font-size: 12px;
+            font-weight: 600;
+            color: #d9e2ec;
+        }
+
+        .setting-meta {
+            font-size: 11px;
+            color: #8aa0b6;
+            line-height: 1.35;
+        }
+
+        .setting-input {
+            width: 100%;
+            padding: 8px 10px;
+            border-radius: 8px;
+            border: 1px solid rgba(148, 163, 184, 0.16);
+            background: #0f1720;
+            color: #e5edf5;
+            font-size: 12px;
+        }
+
+        .plugin-toggle {
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
+        }
+
+        .plugin-toggle input {
+            margin-top: 2px;
+        }
+
+        @media (max-width: 900px) {
+            .topbar {
+                align-items: flex-start;
+                flex-direction: column;
+            }
+
+            .brand {
+                min-width: 0;
+            }
+
+            .toolbar {
+                width: 100%;
+            }
+
+            .sidepanel {
+                top: auto;
+                right: 12px;
+                bottom: 12px;
+                left: 12px;
+                width: auto;
+                max-height: 42vh;
+            }
+
+            .floating-hint {
+                right: 12px;
+                left: 12px;
+                bottom: calc(42vh + 24px);
+                max-width: none;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="app-shell">
+        <header class="topbar">
+            <div class="brand">
+                <h1>PCB CAD Pattern Scanner</h1>
+                <p>Upload, select polygon, then scan.</p>
+            </div>
+            <div class="toolbar">
+                <div class="toolbar-group">
+                    <input type="file" id="dxf-file" accept=".dxf">
+                    <label>
+                        <input type="checkbox" id="fast-cache-build"> Fast build
+                    </label>
+                    <label>
+                        <input type="checkbox" id="prune-entities"> Filter types
+                    </label>
+                    <input
+                        type="text"
+                        id="keep-types"
+                        value="ARC,CIRCLE,ELLIPSE,LINE,LWPOLYLINE,POLYLINE,SPLINE"
+                        placeholder="LINE,CIRCLE,LWPOLYLINE"
+                        style="min-width: 320px;"
+                    >
+                    <input
+                        type="number"
+                        id="remove-top-circle-radii"
+                        min="0"
+                        step="1"
+                        value="0"
+                        placeholder="0"
+                        style="width: 92px;"
+                        title="Remove top N most common circle radii groups"
+                    >
+                    <button onclick="uploadDXF()">Upload DXF</button>
+                </div>
+                <div class="toolbar-group">
+                    <span>Select</span>
+                    <label><input type="radio" name="selector-mode" value="polygon" checked> Polygon</label>
+                    <label><input type="radio" name="selector-mode" value="click"> Click</label>
+                </div>
+                <div class="toolbar-group">
+                    <button class="btn-sm" onclick="clearPoly()">Clear Selection</button>
+                    <button class="btn-sm" onclick="resetView()">Reset View</button>
+                    <button class="btn-sm" onclick="cleanHighlight()">Clean Highlight</button>
+                    <button id="btn-remove-entities" class="btn-sm btn-danger" onclick="removeSelectedEntities()" disabled>Remove Selected</button>
+                    <button id="btn-download-matched-dxf" class="btn-sm" onclick="downloadMatchedDXF()" disabled>Download Matched DXF</button>
+                </div>
+                <div class="toolbar-group">
+                    <span>Scan</span>
+                    <label><input type="radio" name="scan-mode" value="/scan" checked> Standard</label>
+                    <label><input type="radio" name="scan-mode" value="/scan_fast"> Fast</label>
+                    <button id="btn-scan" onclick="scanTemplate()" disabled>Run Scan</button>
+                </div>
+            </div>
+        </header>
+
+        <main class="viewer-shell">
+            <div id="canvas-container">
+                <div id="transform-wrapper">
+                    <div id="svg-display"></div>
+                    <svg id="svg-overlay"
+                        style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:10;">
+                        <g id="removed-group"></g>
+                        <g id="poly-group"></g>
+                        <g id="template-group"></g>
+                        <g id="hl-group"></g>
+                    </svg>
+                </div>
+            </div>
+
+            <div class="sidepanel">
+                <section class="status-card">
+                    <h2>Scan Status</h2>
+                    <p id="scan-status" class="status-line"></p>
+                    <details open>
+                        <summary>Settings</summary>
+                        <div class="details-body">
+                            <div id="settings-container" class="settings-stack">
+                                <div class="setting-meta">Loading settings...</div>
+                            </div>
+                        </div>
+                    </details>
+                    <details>
+                        <summary>Upload</summary>
+                        <div class="details-body">
+                            <pre id="upload-result">No upload yet</pre>
+                        </div>
+                    </details>
+                    <details open>
+                        <summary>Template</summary>
+                        <div class="details-body">
+                            <pre id="extract-result">No data yet</pre>
+                        </div>
+                    </details>
+                    <details>
+                        <summary>Matches</summary>
+                        <div class="details-body">
+                            <pre id="scan-result">Waiting for scan...</pre>
+                        </div>
+                    </details>
+                </section>
+            </div>
+
+            <div class="floating-hint">
+                <p id="selection-hint" class="hint">Left-click to add vertex. Double-click or click the first point to close. Right-drag to pan. Scroll to zoom. Press ESC to clear.</p>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        // --- DOM ---
+        const container = document.getElementById('canvas-container');
+        const wrapper = document.getElementById('transform-wrapper');
+        const svgDisplay = document.getElementById('svg-display');
+        const svgOverlay = document.getElementById('svg-overlay');
+        const uploadResult = document.getElementById('upload-result');
+        const removedG = document.getElementById('removed-group');
+        const polyG = document.getElementById('poly-group');
+        const tmplG = document.getElementById('template-group');
+        const hlG = document.getElementById('hl-group');
+        const btnRemoveEntities = document.getElementById('btn-remove-entities');
+        const btnDownloadMatchedDxf = document.getElementById('btn-download-matched-dxf');
+        const selectionHint = document.getElementById('selection-hint');
+        const settingsContainer = document.getElementById('settings-container');
+
+        // --- State ---
+        let scale = 1, panX = 0, panY = 0;
+        let isPanning = false, panLastX = 0, panLastY = 0;
+        let polyPts = [], polyClosed = false;
+        let clickSelections = [];
+        let removedHighlights = [];
+        let selectorMode = 'polygon';
+        let currentTemplate = null;
+        let currentMatchResult = null;
+        let currentCacheId = null;
+        let settingsSchema = { plugins: [], hyperparameters: [] };
+        let contentW = 0, contentH = 0;
+        let svgViewport = { x0: 0, y0: 0, w: 0, h: 0 };
+        const MAX_TEMPLATE_HIGHLIGHTS_TO_DRAW = 250;
+        const MAX_MATCHES_TO_DRAW = 200;
+        const MAX_HIGHLIGHTS_PER_MATCH_TO_DRAW = 80;
+        const MAX_TOTAL_HIGHLIGHTS_TO_DRAW = 1800;
+        const MAX_ENTITIES_PREVIEW = 60;
+        const MAX_MATCHES_PREVIEW = 80;
+        const MAX_POLYLINE_POINTS_DRAW = 400;
+
+        function renderSettingsSchema(schema) {
+            settingsContainer.innerHTML = '';
+
+            var pluginTitle = document.createElement('p');
+            pluginTitle.className = 'settings-subtitle';
+            pluginTitle.innerText = 'Plugins';
+            settingsContainer.appendChild(pluginTitle);
+
+            if ((schema.plugins || []).length === 0) {
+                var emptyPlugins = document.createElement('div');
+                emptyPlugins.className = 'setting-meta';
+                emptyPlugins.innerText = 'No plugins available.';
+                settingsContainer.appendChild(emptyPlugins);
+            } else {
+                schema.plugins.forEach(function (plugin) {
+                    var item = document.createElement('div');
+                    item.className = 'setting-item';
+
+                    var toggle = document.createElement('label');
+                    toggle.className = 'plugin-toggle';
+                    var input = document.createElement('input');
+                    input.type = 'checkbox';
+                    input.checked = !!plugin.default_enabled;
+                    input.setAttribute('data-plugin-id', plugin.id);
+
+                    var textWrap = document.createElement('div');
+                    var title = document.createElement('div');
+                    title.className = 'setting-title';
+                    title.innerText = plugin.label;
+                    var meta = document.createElement('div');
+                    meta.className = 'setting-meta';
+                    meta.innerText = plugin.description || '';
+
+                    textWrap.appendChild(title);
+                    textWrap.appendChild(meta);
+                    toggle.appendChild(input);
+                    toggle.appendChild(textWrap);
+                    item.appendChild(toggle);
+                    settingsContainer.appendChild(item);
+                });
+            }
+
+            var hyperTitle = document.createElement('p');
+            hyperTitle.className = 'settings-subtitle';
+            hyperTitle.innerText = 'Hyperparameters';
+            settingsContainer.appendChild(hyperTitle);
+
+            (schema.hyperparameters || []).forEach(function (hp) {
+                var item = document.createElement('div');
+                item.className = 'setting-item';
+
+                var title = document.createElement('div');
+                title.className = 'setting-title';
+                title.innerText = hp.label;
+
+                var meta = document.createElement('div');
+                meta.className = 'setting-meta';
+                meta.innerText = hp.description || '';
+
+                var input = document.createElement('input');
+                input.className = 'setting-input';
+                input.type = 'number';
+                input.value = hp.default;
+                input.step = hp.step;
+                if (hp.min !== undefined) input.min = hp.min;
+                if (hp.max !== undefined) input.max = hp.max;
+                input.setAttribute('data-setting-id', hp.id);
+                input.setAttribute('data-setting-type', hp.type || 'float');
+
+                item.appendChild(title);
+                item.appendChild(meta);
+                item.appendChild(input);
+                settingsContainer.appendChild(item);
+            });
+        }
+
+        async function loadSettingsSchema() {
+            try {
+                var res = await fetch('/settings_schema');
+                var data = await res.json();
+                settingsSchema = data || { plugins: [], hyperparameters: [] };
+                renderSettingsSchema(settingsSchema);
+            } catch (_) {
+                settingsContainer.innerHTML = '<div class="setting-meta">Failed to load settings.</div>';
+            }
+        }
+
+        function collectSelectedPlugins() {
+            return Array.from(settingsContainer.querySelectorAll('[data-plugin-id]:checked')).map(function (el) {
+                return el.getAttribute('data-plugin-id');
+            });
+        }
+
+        function collectRuntimeSettings() {
+            var settings = {};
+            Array.from(settingsContainer.querySelectorAll('[data-setting-id]')).forEach(function (el) {
+                var key = el.getAttribute('data-setting-id');
+                var raw = el.value;
+                if (raw === '') return;
+                var type = el.getAttribute('data-setting-type');
+                var value = type === 'int' ? parseInt(raw, 10) : parseFloat(raw);
+                if (!Number.isNaN(value)) settings[key] = value;
+            });
+            return settings;
+        }
+
+        function getRuntimeSettingValue(settingId, fallback) {
+            var el = settingsContainer.querySelector('[data-setting-id="' + settingId + '"]');
+            if (!el) return fallback;
+            var type = el.getAttribute('data-setting-type');
+            var raw = el.value;
+            if (raw === '') return fallback;
+            var value = type === 'int' ? parseInt(raw, 10) : parseFloat(raw);
+            return Number.isNaN(value) ? fallback : value;
+        }
+
+        function getSelectionPrompt() {
+            return selectorMode === 'click'
+                ? 'Upload successful. Click a feature to select it.'
+                : 'Upload successful. Click to add vertices and select a feature.';
+        }
+
+        function getEmptySelectionMessage() {
+            return selectorMode === 'click'
+                ? 'No feature found near the clicked position.'
+                : 'No valid entities found in selection.';
+        }
+
+        function getIdleSelectionPrompt() {
+            if (!currentCacheId) return 'No data yet';
+            return getSelectionPrompt();
+        }
+
+        function updateSelectionHint() {
+            selectionHint.innerText = selectorMode === 'click'
+                ? 'Click to select one feature. Hold Shift and click to add or remove features. Right-drag to pan. Scroll to zoom. Press ESC to clear.'
+                : 'Left-click to add vertex. Double-click or click the first point to close. Right-drag to pan. Scroll to zoom. Press ESC to clear.';
+        }
+
+        function setSelectorMode(mode) {
+            selectorMode = mode === 'click' ? 'click' : 'polygon';
+            clearPoly(true);
+            document.getElementById('extract-result').innerText = getIdleSelectionPrompt();
+            updateSelectionHint();
+        }
+
+        function setSelectionButtonsEnabled(enabled) {
+            document.getElementById('btn-scan').disabled = !enabled;
+            btnRemoveEntities.disabled = !enabled;
+        }
+
+        function setMatchButtonsEnabled(enabled) {
+            btnDownloadMatchedDxf.disabled = !enabled;
+        }
+
+        function makeEntityKey(entity) {
+            return JSON.stringify([
+                entity.type,
+                entity.size,
+                entity.x,
+                entity.y,
+                entity.shape_sig || null,
+            ]);
+        }
+
+        function computeGroupCenter(entities) {
+            if (!entities.length) return null;
+            var sx = 0, sy = 0;
+            entities.forEach(function (entity) {
+                sx += entity.x;
+                sy += entity.y;
+            });
+            return {
+                x: Number((sx / entities.length).toFixed(3)),
+                y: Number((sy / entities.length).toFixed(3)),
+            };
+        }
+
+        function setExtractPreviewFromClickSelection(note) {
+            if (!clickSelections.length) {
+                document.getElementById('extract-result').innerText = note
+                    ? note + "\n" + getIdleSelectionPrompt()
+                    : getIdleSelectionPrompt();
+                return;
+            }
+            var previewLimit = getRuntimeSettingValue('entities_preview_limit', MAX_ENTITIES_PREVIEW);
+            var entities = clickSelections.map(function (item) { return item.entity; });
+            var preview = {
+                selector_mode: 'click',
+                entity_count: entities.length,
+                group_center: computeGroupCenter(entities),
+                entities_preview: entities.slice(0, previewLimit),
+            };
+            var text = JSON.stringify(preview, null, 2);
+            if (entities.length > previewLimit) {
+                text += "\n... entities preview truncated (" + previewLimit + "/" + entities.length + ")";
+            }
+            document.getElementById('extract-result').innerText = note ? note + "\n" + text : text;
+        }
+
+        function syncClickSelectionState(note) {
+            if (!clickSelections.length) {
+                currentTemplate = null;
+                tmplG.innerHTML = '';
+                setSelectionButtonsEnabled(false);
+                setExtractPreviewFromClickSelection(note);
+                return;
+            }
+
+            var entities = clickSelections.map(function (item) { return item.entity; });
+            currentTemplate = {
+                cache_id: currentCacheId,
+                group_center: computeGroupCenter(entities),
+                entities: entities,
+            };
+            renderTemplateHighlights(
+                clickSelections
+                    .map(function (item) { return item.highlight; })
+                    .filter(function (item) { return !!item; })
+            );
+            setSelectionButtonsEnabled(true);
+            setExtractPreviewFromClickSelection(note);
+        }
+
+        function extractSelectionItem(result) {
+            var entities = result.entities_preview || result.entities || [];
+            var entity = entities[0];
+            if (!entity) return null;
+            return {
+                key: makeEntityKey(entity),
+                entity: entity,
+                highlight: (result.highlights || [])[0] || null,
+            };
+        }
+
+        // --- Transform ---
+        function applyTransform() {
+            wrapper.style.transform = 'translate(' + panX + 'px,' + panY + 'px) scale(' + scale + ')';
+        }
+        function syncCanvasSize() {
+            contentW = container.clientWidth;
+            contentH = container.clientHeight;
+            svgOverlay.setAttribute("viewBox", "0 0 " + contentW + " " + contentH);
+            svgViewport = getSvgViewport();
+            if (removedHighlights.length) renderRemovedHighlights();
+        }
+        function screenToContent(cx, cy) {
+            var r = container.getBoundingClientRect();
+            return { x: (cx - r.left - panX) / scale, y: (cy - r.top - panY) / scale };
+        }
+        function getSvgViewport() {
+            var fallback = { x0: 0, y0: 0, w: contentW, h: contentH };
+            var svgEl = svgDisplay.querySelector('svg');
+            if (!svgEl || !contentW || !contentH) return fallback;
+
+            var vb = svgEl.viewBox && svgEl.viewBox.baseVal;
+            if (!vb || !vb.width || !vb.height) return fallback;
+
+            var par = (svgEl.getAttribute('preserveAspectRatio') || 'xMidYMid meet').trim();
+            par = par.replace(/^defer\s+/, '');
+            if (par === 'none') return fallback;
+
+            var parts = par.split(/\s+/);
+            var align = parts[0] || 'xMidYMid';
+            var mode = parts[1] || 'meet';
+
+            var sx = contentW / vb.width;
+            var sy = contentH / vb.height;
+            var s = mode === 'slice' ? Math.max(sx, sy) : Math.min(sx, sy);
+            var vw = vb.width * s;
+            var vh = vb.height * s;
+
+            var ax = align.indexOf('xMin') === 0 ? 0 : (align.indexOf('xMax') === 0 ? 1 : 0.5);
+            var ay = align.indexOf('YMin') >= 0 ? 0 : (align.indexOf('YMax') >= 0 ? 1 : 0.5);
+
+            return {
+                x0: (contentW - vw) * ax,
+                y0: (contentH - vh) * ay,
+                w: vw,
+                h: vh,
+            };
+        }
+        function contentToSvgPct(p) {
+            if (!svgViewport.w || !svgViewport.h) return [0, 0];
+            return [
+                (p.x - svgViewport.x0) / svgViewport.w,
+                (p.y - svgViewport.y0) / svgViewport.h,
+            ];
+        }
+        function svgPctToContent(px, py) {
+            return {
+                x: svgViewport.x0 + px * svgViewport.w,
+                y: svgViewport.y0 + py * svgViewport.h,
+            };
+        }
+        function samplePoints(points, maxPoints) {
+            if (!points || points.length <= maxPoints) return points || [];
+            var step = Math.ceil(points.length / maxPoints);
+            var out = [];
+            for (var i = 0; i < points.length; i += step) out.push(points[i]);
+            var last = points[points.length - 1];
+            if (out.length === 0 || out[out.length - 1] !== last) out.push(last);
+            return out;
+        }
+        function setExtractPreview(result) {
+            if (!result || result.error) {
+                document.getElementById('extract-result').innerText = JSON.stringify(result, null, 2);
+                return;
+            }
+            var previewLimit = getRuntimeSettingValue('entities_preview_limit', MAX_ENTITIES_PREVIEW);
+            var entities = result.entities_preview || result.entities || [];
+            var highlights = result.highlights || [];
+            var entityTotal = result.entity_count ?? entities.length;
+            var highlightTotal = result.highlight_count_total ?? highlights.length;
+            var preview = {
+                cache_id: result.cache_id,
+                template_id: result.template_id,
+                group_center: result.group_center,
+                entity_count: entityTotal,
+                highlight_count: highlightTotal,
+                highlight_count_returned: highlights.length,
+                entities_preview: entities.slice(0, previewLimit),
+            };
+            var text = JSON.stringify(preview, null, 2);
+            if (entityTotal > previewLimit) {
+                text += "\n... entities preview truncated (" + Math.min(previewLimit, entities.length) + "/" + entityTotal + ")";
+            }
+            document.getElementById('extract-result').innerText = text;
+        }
+        function setScanPreview(data) {
+            if (!data || data.error) {
+                document.getElementById('scan-result').innerText = JSON.stringify(data, null, 2);
+                return;
+            }
+            var previewLimit = getRuntimeSettingValue('matches_preview_limit', MAX_MATCHES_PREVIEW);
+            var matches = data.matches || [];
+            var previewMatches = matches.slice(0, previewLimit).map(function (m) {
+                return {
+                    dxf_x: m.dxf_x,
+                    dxf_y: m.dxf_y,
+                    render_pct_x: m.render_pct_x,
+                    render_pct_y: m.render_pct_y,
+                    match_score: m.match_score,
+                    highlight_count_total: m.highlight_count_total ?? (m.highlights ? m.highlights.length : 0),
+                    highlight_count_returned: m.highlight_count_returned ?? (m.highlights ? m.highlights.length : 0),
+                };
+            });
+            var preview = {
+                match_count: data.match_count || matches.length,
+                scan_stats: data.scan_stats || null,
+                matches_preview: previewMatches,
+            };
+            var text = JSON.stringify(preview, null, 2);
+            if (matches.length > previewLimit) {
+                text += "\n... matches preview truncated (" + previewLimit + "/" + matches.length + ")";
+            }
+            document.getElementById('scan-result').innerText = text;
+        }
+        function downloadJson(filename, payload) {
+            if (!payload) return;
+            var text = JSON.stringify(payload, null, 2);
+            var blob = new Blob([text], { type: 'application/json' });
+            var url = URL.createObjectURL(blob);
+            var a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+        async function downloadMatchedDXF() {
+            if (!currentMatchResult || !currentCacheId) return;
+            var res = await fetch('/download_matched_dxf', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    cache_id: currentCacheId,
+                    matches: currentMatchResult.matches || [],
+                })
+            });
+            if (!res.ok) {
+                try {
+                    var err = await res.json();
+                    document.getElementById('extract-result').innerText += "\n" + (err.error || 'DXF download failed.');
+                } catch (_) {
+                    document.getElementById('extract-result').innerText += "\nDXF download failed.";
+                }
+                return;
+            }
+            var blob = await res.blob();
+            var url = URL.createObjectURL(blob);
+            var a = document.createElement('a');
+            var cd = res.headers.get('content-disposition') || '';
+            var m = cd.match(/filename=\"?([^\";]+)\"?/i);
+            a.href = url;
+            a.download = m ? m[1] : 'matched_entities.dxf';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+
+        // --- Upload ---
+        async function uploadDXF() {
+            var fi = document.getElementById('dxf-file');
+            if (!fi.files[0]) return alert("Please select a file");
+            var fastBuild = document.getElementById('fast-cache-build').checked;
+            var pruneEntities = document.getElementById('prune-entities').checked;
+            var keepTypes = document.getElementById('keep-types').value;
+            var removeTopCircleRadii = document.getElementById('remove-top-circle-radii').value || "0";
+            var fd = new FormData(); fd.append("file", fi.files[0]);
+            fd.append("fast_build", fastBuild ? "true" : "false");
+            fd.append("prune_entities", pruneEntities ? "true" : "false");
+            fd.append("keep_types", keepTypes);
+            fd.append("remove_top_circle_radii", removeTopCircleRadii);
+            uploadResult.innerText = "Uploading and converting to SVG...";
+            clearAll();
+            var res = await fetch('/upload', { method: 'POST', body: fd });
+            var data = await res.json();
+            if (data.svg && data.cache_id) {
+                currentCacheId = data.cache_id;
+                svgDisplay.innerHTML = data.svg;
+                requestAnimationFrame(function () {
+                    syncCanvasSize();
+                    var mode = data.build_mode || "accurate";
+                    var removedCircleGroups = (data.removed_circle_groups || []).map(function (g) {
+                        return "r=" + g.radius + " (" + g.count + ")";
+                    }).join(", ");
+                    var lines = [
+                        "Upload successful (" + mode + " build).",
+                        "Type filter: " + (data.prune_entities ? "enabled" : "disabled"),
+                        "Keep types: " + ((data.keep_types || []).join(", ") || "none"),
+                        "Remove top circle radii groups: " + (data.remove_top_circle_radii ?? 0),
+                        "Removed circle groups: " + (removedCircleGroups || "none"),
+                        "DXF entities: " + (data.retained_dxf_entity_count ?? data.dxf_entity_count ?? 0)
+                            + " / " + (data.dxf_entity_count ?? 0),
+                        "Removed filtered entities: " + (data.removed_entity_count ?? 0),
+                        "Removed circles by radius grouping: " + (data.removed_circle_count ?? 0),
+                        "Entity count: " + (data.entity_count ?? 0),
+                        "SVG render time: " + (data.svg_render_time_ms ?? 0) + " ms",
+                        "Cache build time: " + (data.cache_build_time_ms ?? 0) + " ms",
+                    ];
+                    uploadResult.innerText = lines.join("\n");
+                    document.getElementById('extract-result').innerText = getSelectionPrompt();
+                });
+            } else {
+                currentCacheId = null;
+                uploadResult.innerText = JSON.stringify(data, null, 2);
+            }
+        }
+        document.querySelectorAll('input[name="selector-mode"]').forEach(function (el) {
+            el.addEventListener('change', function () {
+                if (this.checked) setSelectorMode(this.value);
+            });
+        });
+        window.addEventListener('resize', function () {
+            if (!contentW || !contentH) return;
+            syncCanvasSize();
+        });
+
+        // --- Pan (right / middle mouse) ---
+        container.addEventListener('mousedown', function (e) {
+            if (e.button === 2 || e.button === 1) {
+                isPanning = true;
+                panLastX = e.clientX; panLastY = e.clientY;
+                container.style.cursor = 'grabbing';
+                e.preventDefault();
+            }
+        });
+        window.addEventListener('mousemove', function (e) {
+            if (isPanning) {
+                panX += e.clientX - panLastX; panY += e.clientY - panLastY;
+                panLastX = e.clientX; panLastY = e.clientY;
+                applyTransform(); return;
+            }
+            if (selectorMode === 'polygon' && polyPts.length > 0 && !polyClosed) drawPoly(e);
+        });
+        window.addEventListener('mouseup', function () {
+            if (isPanning) { isPanning = false; container.style.cursor = 'crosshair'; }
+        });
+        container.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+
+        // --- Zoom (wheel) ---
+        container.addEventListener('wheel', function (e) {
+            e.preventDefault();
+            var r = container.getBoundingClientRect();
+            var mx = e.clientX - r.left, my = e.clientY - r.top;
+            var f = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+            var ns = Math.max(0.1, Math.min(scale * f, 50));
+            panX = mx - (mx - panX) * (ns / scale);
+            panY = my - (my - panY) * (ns / scale);
+            scale = ns;
+            applyTransform();
+        }, { passive: false });
+
+        // --- Polygon selection ---
+        container.addEventListener('click', async function (e) {
+            if (e.button !== 0 || isPanning || !contentW) return;
+            var pt = screenToContent(e.clientX, e.clientY);
+            if (selectorMode === 'click') {
+                if (e.detail >= 2) return;
+                await extractByClick(pt, e.shiftKey);
+                return;
+            }
+            if (e.detail >= 2) return;
+            if (polyClosed) return;
+            if (polyPts.length >= 3) {
+                var f = polyPts[0];
+                var dx = (pt.x - f.x) * scale, dy = (pt.y - f.y) * scale;
+                if (Math.sqrt(dx * dx + dy * dy) < 12) { closePoly(); return; }
+            }
+            polyPts.push(pt);
+            drawPoly(e);
+        });
+        container.addEventListener('dblclick', function (e) {
+            e.preventDefault();
+            if (selectorMode !== 'polygon') return;
+            if (!polyClosed && polyPts.length >= 3) closePoly();
+        });
+        document.addEventListener('keydown', function (e) { if (e.key === 'Escape') clearPoly(); });
+
+        function drawPoly(e) {
+            var NS = "http://www.w3.org/2000/svg";
+            polyG.innerHTML = '';
+            if (!polyPts.length) return;
+            var sw = 2 / scale;
+            var i, ln, c;
+
+            if (polyClosed) {
+                var pg = document.createElementNS(NS, "polygon");
+                pg.setAttribute("points", polyPts.map(function (p) { return p.x + ',' + p.y; }).join(' '));
+                pg.setAttribute("fill", "rgba(0,123,255,0.15)");
+                pg.setAttribute("stroke", "#007bff"); pg.setAttribute("stroke-width", sw);
+                polyG.appendChild(pg);
+            } else {
+                for (i = 1; i < polyPts.length; i++) {
+                    ln = document.createElementNS(NS, "line");
+                    ln.setAttribute("x1", polyPts[i - 1].x); ln.setAttribute("y1", polyPts[i - 1].y);
+                    ln.setAttribute("x2", polyPts[i].x); ln.setAttribute("y2", polyPts[i].y);
+                    ln.setAttribute("stroke", "#007bff"); ln.setAttribute("stroke-width", sw);
+                    polyG.appendChild(ln);
+                }
+                if (e) {
+                    var cur = screenToContent(e.clientX, e.clientY);
+                    var last = polyPts[polyPts.length - 1];
+                    ln = document.createElementNS(NS, "line");
+                    ln.setAttribute("x1", last.x); ln.setAttribute("y1", last.y);
+                    ln.setAttribute("x2", cur.x); ln.setAttribute("y2", cur.y);
+                    ln.setAttribute("stroke", "#007bff"); ln.setAttribute("stroke-width", sw);
+                    ln.setAttribute("stroke-dasharray", 4 / scale);
+                    polyG.appendChild(ln);
+                }
+            }
+            var vr = 4 / scale;
+            for (i = 0; i < polyPts.length; i++) {
+                c = document.createElementNS(NS, "circle");
+                c.setAttribute("cx", polyPts[i].x); c.setAttribute("cy", polyPts[i].y);
+                c.setAttribute("r", (i === 0 && polyPts.length >= 3) ? vr * 1.5 : vr);
+                c.setAttribute("fill", (i === 0 && polyPts.length >= 3) ? "#28a745" : "#007bff");
+                c.setAttribute("stroke", "white"); c.setAttribute("stroke-width", 1 / scale);
+                polyG.appendChild(c);
+            }
+        }
+
+        async function requestExtract(payload, pendingText) {
+            if (!currentCacheId) {
+                document.getElementById('extract-result').innerText = "Session expired. Please upload DXF again.";
+                return null;
+            }
+            currentMatchResult = null;
+            setMatchButtonsEnabled(false);
+            document.getElementById('extract-result').innerText = pendingText;
+            var requestPayload = Object.assign({}, payload, {
+                settings: collectRuntimeSettings(),
+            });
+            var res = await fetch('/extract', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(requestPayload)
+            });
+            return await res.json();
+        }
+
+        function applyExtractResult(result) {
+            setExtractPreview(result);
+            if (result.error) {
+                tmplG.innerHTML = '';
+                currentTemplate = null;
+                setSelectionButtonsEnabled(false);
+            } else if ((result.entity_count || 0) > 0 && result.template_id) {
+                currentTemplate = {
+                    cache_id: result.cache_id || currentCacheId,
+                    template_id: result.template_id,
+                    group_center: result.group_center,
+                    entity_count: result.entity_count || 0,
+                    entities_preview: result.entities_preview || [],
+                };
+                renderTemplateHighlights(result.highlights || []);
+                setSelectionButtonsEnabled(true);
+            } else {
+                tmplG.innerHTML = '';
+                currentTemplate = null;
+                document.getElementById('extract-result').innerText += "\n" + getEmptySelectionMessage();
+                setSelectionButtonsEnabled(false);
+            }
+        }
+
+        async function extractSelection(payload, pendingText) {
+            var result = await requestExtract(payload, pendingText);
+            if (!result) return null;
+            applyExtractResult(result);
+            return result;
+        }
+
+        async function extractByClick(pt, toggleSelection) {
+            var result = await requestExtract(
+                {
+                    cache_id: currentCacheId,
+                    click_pct: contentToSvgPct(pt),
+                },
+                "Picking feature..."
+            );
+            if (!result) return;
+            if (result.error) {
+                clickSelections = [];
+                applyExtractResult(result);
+                return;
+            }
+
+            var item = extractSelectionItem(result);
+            if (!item) {
+                if (!toggleSelection) {
+                    clickSelections = [];
+                    syncClickSelectionState("Selection cleared. " + getEmptySelectionMessage());
+                } else {
+                    syncClickSelectionState(getEmptySelectionMessage());
+                }
+                return;
+            }
+
+            var existingIndex = clickSelections.findIndex(function (entry) {
+                return entry.key === item.key;
+            });
+            if (toggleSelection) {
+                if (existingIndex >= 0) {
+                    clickSelections.splice(existingIndex, 1);
+                    syncClickSelectionState("Feature removed from selection.");
+                    return;
+                }
+                clickSelections.push(item);
+                syncClickSelectionState("Feature added to selection.");
+                return;
+            }
+
+            clickSelections = [item];
+            syncClickSelectionState("Feature selected.");
+        }
+
+        async function closePoly() {
+            if (!currentCacheId) {
+                document.getElementById('extract-result').innerText = "Session expired. Please upload DXF again.";
+                return;
+            }
+            polyClosed = true;
+            drawPoly(null);
+            await extractSelection(
+                {
+                    cache_id: currentCacheId,
+                    polygon_pct: polyPts.map(function (p) { return contentToSvgPct(p); })
+                },
+                "Extracting features..."
+            );
+        }
+
+        function renderTemplateHighlights(highlights) {
+            var NS = "http://www.w3.org/2000/svg";
+            var sw = 2 / scale;
+            var drawLimit = getRuntimeSettingValue('template_highlights_draw_limit', MAX_TEMPLATE_HIGHLIGHTS_TO_DRAW);
+            var polylinePointLimit = getRuntimeSettingValue('polyline_points_draw_limit', MAX_POLYLINE_POINTS_DRAW);
+            tmplG.innerHTML = "";
+            var drawList = (highlights || []).slice(0, drawLimit);
+            drawList.forEach(function (h) {
+                if (h.kind === "circle") {
+                    var c = document.createElementNS(NS, "circle");
+                    var cc = svgPctToContent(h.cx_pct, h.cy_pct);
+                    c.setAttribute("cx", cc.x);
+                    c.setAttribute("cy", cc.y);
+                    c.setAttribute("r", Math.max(h.r_pct * svgViewport.w, 2 / scale));
+                    c.setAttribute("fill", "rgba(0, 200, 83, 0.12)");
+                    c.setAttribute("stroke", "#00c853");
+                    c.setAttribute("stroke-width", sw);
+                    tmplG.appendChild(c);
+                } else if (h.kind === "polyline") {
+                    var pl = document.createElementNS(NS, "polyline");
+                    var pts = samplePoints(h.points_pct, polylinePointLimit).map(function (pt) {
+                        var p = svgPctToContent(pt[0], pt[1]);
+                        return p.x + "," + p.y;
+                    });
+                    pl.setAttribute("points", pts.join(" "));
+                    pl.setAttribute("fill", "none");
+                    pl.setAttribute("stroke", "#00c853");
+                    pl.setAttribute("stroke-width", sw);
+                    tmplG.appendChild(pl);
+                }
+            });
+            if (highlights && highlights.length > drawLimit) {
+                document.getElementById('extract-result').innerText +=
+                    "\nHighlight draw capped: " + drawLimit + "/" + highlights.length;
+            }
+        }
+
+        function renderRemovedHighlights() {
+            var NS = "http://www.w3.org/2000/svg";
+            var sw = 4 / scale;
+            var polylinePointLimit = getRuntimeSettingValue('polyline_points_draw_limit', MAX_POLYLINE_POINTS_DRAW);
+            removedG.innerHTML = "";
+            removedHighlights.forEach(function (h) {
+                if (h.kind === "circle") {
+                    var c = document.createElementNS(NS, "circle");
+                    var cc = svgPctToContent(h.cx_pct, h.cy_pct);
+                    c.setAttribute("cx", cc.x);
+                    c.setAttribute("cy", cc.y);
+                    c.setAttribute("r", Math.max(h.r_pct * svgViewport.w, 3 / scale));
+                    c.setAttribute("fill", "#1f2328");
+                    c.setAttribute("stroke", "#1f2328");
+                    c.setAttribute("stroke-width", sw);
+                    removedG.appendChild(c);
+                } else if (h.kind === "polyline") {
+                    var pl = document.createElementNS(NS, "polyline");
+                    var pts = samplePoints(h.points_pct, polylinePointLimit).map(function (pt) {
+                        var p = svgPctToContent(pt[0], pt[1]);
+                        return p.x + "," + p.y;
+                    });
+                    pl.setAttribute("points", pts.join(" "));
+                    pl.setAttribute("fill", "none");
+                    pl.setAttribute("stroke", "#1f2328");
+                    pl.setAttribute("stroke-width", sw);
+                    pl.setAttribute("stroke-linecap", "round");
+                    pl.setAttribute("stroke-linejoin", "round");
+                    removedG.appendChild(pl);
+                }
+            });
+        }
+
+        async function removeSelectedEntities() {
+            if (!currentTemplate || !currentCacheId) return;
+            document.getElementById('extract-result').innerText = "Removing selected entities...";
+            currentMatchResult = null;
+            setMatchButtonsEnabled(false);
+            var payload = { cache_id: currentCacheId };
+            if (currentTemplate.template_id) {
+                payload.template_id = currentTemplate.template_id;
+            } else {
+                payload.entities = currentTemplate.entities || [];
+            }
+            var res = await fetch('/remove_entities', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            var data = await res.json();
+            if (data.error) {
+                document.getElementById('extract-result').innerText = JSON.stringify(data, null, 2);
+                return;
+            }
+            removedHighlights = removedHighlights.concat(data.removed_highlights || []);
+            renderRemovedHighlights();
+            clearPoly(true);
+            document.getElementById('scan-result').innerText = 'Waiting for scan...';
+            document.getElementById('scan-status').innerText = '';
+            uploadResult.innerText += "\nRemoved entities: " + (data.removed_count || 0)
+                + " | Remaining: " + (data.remaining_entity_count ?? 0);
+            document.getElementById('extract-result').innerText =
+                "Removed " + (data.removed_count || 0) + " entities.\n" + getIdleSelectionPrompt();
+        }
+
+        function clearPoly(silent) {
+            polyPts = []; polyClosed = false; polyG.innerHTML = '';
+            clickSelections = [];
+            tmplG.innerHTML = '';
+            currentTemplate = null;
+            currentMatchResult = null;
+            setSelectionButtonsEnabled(false);
+            setMatchButtonsEnabled(false);
+            if (!silent) {
+                document.getElementById('extract-result').innerText = "Cleared. " + getIdleSelectionPrompt();
+            }
+        }
+        function cleanHighlight() {
+            tmplG.innerHTML = '';
+            hlG.innerHTML = '';
+        }
+        function resetView() { scale = 1; panX = 0; panY = 0; applyTransform(); }
+        function clearAll() {
+            clearPoly(true); hlG.innerHTML = '';
+            removedHighlights = [];
+            removedG.innerHTML = '';
+            currentCacheId = null;
+            resetView();
+            document.getElementById('scan-status').innerText = '';
+            document.getElementById('scan-result').innerText = 'Waiting for scan...';
+            setMatchButtonsEnabled(false);
+        }
+
+        // --- Scan ---
+        async function scanTemplate() {
+            if (!currentTemplate || !currentCacheId) return;
+            var endpoint = document.querySelector('input[name="scan-mode"]:checked').value;
+            document.getElementById('scan-status').innerText = "Scanning...";
+            document.getElementById('scan-result').innerText = "";
+            hlG.innerHTML = "";
+            var t0 = performance.now();
+            var payload = { cache_id: currentCacheId };
+            if (currentTemplate.template_id) {
+                payload.template_id = currentTemplate.template_id;
+            } else {
+                payload.entities = currentTemplate.entities || [];
+                payload.group_center = currentTemplate.group_center || null;
+            }
+            payload.plugins = collectSelectedPlugins();
+            payload.settings = collectRuntimeSettings();
+            var res = await fetch(endpoint, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            var data = await res.json();
+            var elapsed = ((performance.now() - t0) / 1000).toFixed(2);
+            if (data.error) {
+                document.getElementById('scan-status').innerText = data.error;
+                document.getElementById('scan-result').innerText = JSON.stringify(data, null, 2);
+                currentMatchResult = null;
+                setMatchButtonsEnabled(false);
+                return;
+            }
+            document.getElementById('scan-status').innerText = 'Scan complete! Found ' + data.match_count + ' matches (' + elapsed + 's)';
+            var noHighlightMatches = (data.matches || []).filter(function (m) {
+                return (m.highlight_count_total || 0) > 0 && (m.highlight_count_returned || 0) === 0;
+            }).length;
+            if (noHighlightMatches > 0) {
+                document.getElementById('scan-status').innerText +=
+                    ' | Server highlight payload capped for ' + noHighlightMatches + ' matches';
+            }
+            if (data.scan_stats && data.scan_stats.score_max !== undefined) {
+                document.getElementById('scan-status').innerText +=
+                    ' | score_max=' + data.scan_stats.score_max;
+            }
+            setScanPreview(data);
+            renderHighlights(data.matches);
+            currentMatchResult = data;
+            setMatchButtonsEnabled((data.match_count || 0) > 0);
+        }
+
+        function renderHighlights(matches) {
+            var NS = "http://www.w3.org/2000/svg";
+            var sw = 2 / scale;
+            var matchesDrawLimit = getRuntimeSettingValue('matches_draw_limit', MAX_MATCHES_TO_DRAW);
+            var highlightsPerMatchLimit = getRuntimeSettingValue('highlights_per_match_draw_limit', MAX_HIGHLIGHTS_PER_MATCH_TO_DRAW);
+            var totalHighlightsLimit = getRuntimeSettingValue('total_highlights_draw_limit', MAX_TOTAL_HIGHLIGHTS_TO_DRAW);
+            var polylinePointLimit = getRuntimeSettingValue('polyline_points_draw_limit', MAX_POLYLINE_POINTS_DRAW);
+            hlG.innerHTML = "";
+            var drawMatches = (matches || []).slice(0, matchesDrawLimit);
+            var drawnHighlights = 0;
+            var droppedPerMatch = 0;
+            var droppedGlobal = 0;
+            drawMatches.forEach(function (match) {
+                if (!match.highlights) return;
+                if (drawnHighlights >= totalHighlightsLimit) {
+                    droppedGlobal += match.highlights.length;
+                    return;
+                }
+                var perMatch = match.highlights.slice(0, highlightsPerMatchLimit);
+                droppedPerMatch += Math.max(0, match.highlights.length - perMatch.length);
+                var remaining = totalHighlightsLimit - drawnHighlights;
+                var drawHs = perMatch.slice(0, remaining);
+                droppedGlobal += Math.max(0, perMatch.length - drawHs.length);
+                drawHs.forEach(function (h) {
+                    if (h.kind === "circle") {
+                        var c = document.createElementNS(NS, "circle");
+                        var cc = svgPctToContent(h.cx_pct, h.cy_pct);
+                        c.setAttribute("cx", cc.x);
+                        c.setAttribute("cy", cc.y);
+                        c.setAttribute("r", Math.max(h.r_pct * svgViewport.w, 2 / scale));
+                        c.setAttribute("fill", "none");
+                        c.setAttribute("stroke", "red"); c.setAttribute("stroke-width", sw);
+                        hlG.appendChild(c);
+                    } else if (h.kind === "polyline") {
+                        var pl = document.createElementNS(NS, "polyline");
+                        var pts = samplePoints(h.points_pct, polylinePointLimit).map(function (pt) {
+                            var p = svgPctToContent(pt[0], pt[1]);
+                            return p.x + "," + p.y;
+                        });
+                        pl.setAttribute("points", pts.join(" "));
+                        pl.setAttribute("fill", "none");
+                        pl.setAttribute("stroke", "red");
+                        pl.setAttribute("stroke-width", sw);
+                        hlG.appendChild(pl);
+                    }
+                });
+                drawnHighlights += drawHs.length;
+            });
+            if (matches && matches.length > matchesDrawLimit) {
+                document.getElementById('scan-status').innerText +=
+                    " | Highlight draw capped: " + matchesDrawLimit + "/" + matches.length;
+            }
+            if (droppedPerMatch > 0 || droppedGlobal > 0) {
+                document.getElementById('scan-status').innerText +=
+                    " | Draw detail capped (per-match: " + droppedPerMatch + ", global: " + droppedGlobal + ")";
+            }
+        }
+
+        updateSelectionHint();
+        loadSettingsSchema();
+    </script>
+</body>
+
+</html>
