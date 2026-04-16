@@ -338,6 +338,52 @@
             margin-top: 2px;
         }
 
+        .library-save-fields {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            margin-bottom: 10px;
+        }
+
+        .library-status {
+            margin: 0 0 10px;
+        }
+
+        .library-category {
+            gap: 8px;
+        }
+
+        .library-category.active {
+            border-color: rgba(77, 163, 255, 0.42);
+            background: rgba(77, 163, 255, 0.1);
+        }
+
+        .library-category-header,
+        .library-template-row {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 8px;
+        }
+
+        .library-template-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .library-template-row {
+            padding: 8px 10px;
+            border-radius: 10px;
+            background: rgba(148, 163, 184, 0.05);
+            border: 1px solid rgba(148, 163, 184, 0.08);
+        }
+
+        .library-template-row.active {
+            border-color: rgba(77, 163, 255, 0.36);
+            background: rgba(77, 163, 255, 0.08);
+        }
+
         @media (max-width: 900px) {
             .topbar {
                 align-items: flex-start;
@@ -442,6 +488,25 @@
                             </div>
                         </div>
                     </details>
+                    <details open>
+                        <summary>Template Library</summary>
+                        <div class="details-body">
+                            <div class="library-save-fields">
+                                <input id="saved-template-name" class="setting-input" type="text"
+                                    placeholder="Template name">
+                                <input id="saved-template-category" class="setting-input" type="text"
+                                    placeholder="Category, e.g. SMD" value="Uncategorized">
+                                <button id="btn-save-template" class="btn-sm" onclick="saveCurrentTemplate()" disabled>
+                                    Save Current Template
+                                </button>
+                            </div>
+                            <p id="template-library-status" class="setting-meta library-status">Loading template
+                                library...</p>
+                            <div id="template-library-container" class="settings-stack">
+                                <div class="setting-meta">Loading template library...</div>
+                            </div>
+                        </div>
+                    </details>
                     <details>
                         <summary>Upload</summary>
                         <div class="details-body">
@@ -485,6 +550,11 @@
         const btnDownloadMatchedDxf = document.getElementById('btn-download-matched-dxf');
         const selectionHint = document.getElementById('selection-hint');
         const settingsContainer = document.getElementById('settings-container');
+        const templateLibraryContainer = document.getElementById('template-library-container');
+        const templateLibraryStatus = document.getElementById('template-library-status');
+        const savedTemplateNameInput = document.getElementById('saved-template-name');
+        const savedTemplateCategoryInput = document.getElementById('saved-template-category');
+        const btnSaveTemplate = document.getElementById('btn-save-template');
 
         // --- State ---
         let scale = 1, panX = 0, panY = 0;
@@ -494,9 +564,13 @@
         let removedHighlights = [];
         let selectorMode = 'polygon';
         let currentTemplate = null;
+        let currentTemplateBundle = null;
         let currentMatchResult = null;
         let currentCacheId = null;
         let settingsSchema = { plugins: [], hyperparameters: [] };
+        let templateLibraryData = { categories: [], template_count: 0 };
+        let activeLibraryTemplateId = null;
+        let activeLibraryCategory = null;
         let contentW = 0, contentH = 0;
         let svgViewport = { x0: 0, y0: 0, w: 0, h: 0 };
         const MAX_TEMPLATE_HIGHLIGHTS_TO_DRAW = 250;
@@ -623,6 +697,238 @@
             return Number.isNaN(value) ? fallback : value;
         }
 
+        function updateSaveTemplateButton() {
+            var entities = currentTemplate && currentTemplate.entities ? currentTemplate.entities : [];
+            var canSave = !!currentTemplate && (
+                (currentTemplate.template_id && currentTemplate.cache_id) ||
+                entities.length > 0
+            );
+            btnSaveTemplate.disabled = !canSave;
+        }
+
+        function renderTemplateLibrary(data) {
+            templateLibraryData = data || { categories: [], template_count: 0 };
+            templateLibraryContainer.innerHTML = '';
+
+            if (!(templateLibraryData.categories || []).length) {
+                templateLibraryContainer.innerHTML = '<div class="setting-meta">No saved templates yet.</div>';
+                return;
+            }
+
+            templateLibraryData.categories.forEach(function (category) {
+                var categoryItem = document.createElement('div');
+                categoryItem.className = 'setting-item library-category' + (activeLibraryCategory === category.name ? ' active' : '');
+
+                var header = document.createElement('div');
+                header.className = 'library-category-header';
+
+                var headerInfo = document.createElement('div');
+                var title = document.createElement('div');
+                title.className = 'setting-title';
+                title.innerText = category.name;
+                var meta = document.createElement('div');
+                meta.className = 'setting-meta';
+                meta.innerText = (category.template_count || 0) + ' templates';
+                headerInfo.appendChild(title);
+                headerInfo.appendChild(meta);
+
+                var useCategoryBtn = document.createElement('button');
+                useCategoryBtn.className = 'btn-sm';
+                useCategoryBtn.type = 'button';
+                useCategoryBtn.innerText = 'Use Category';
+                useCategoryBtn.onclick = function () { useSavedTemplateCategory(category.name); };
+
+                header.appendChild(headerInfo);
+                header.appendChild(useCategoryBtn);
+                categoryItem.appendChild(header);
+
+                var templateList = document.createElement('div');
+                templateList.className = 'library-template-list';
+                (category.templates || []).forEach(function (template) {
+                    var row = document.createElement('div');
+                    row.className = 'library-template-row' + (activeLibraryTemplateId === template.id ? ' active' : '');
+
+                    var info = document.createElement('div');
+                    var rowTitle = document.createElement('div');
+                    rowTitle.className = 'setting-title';
+                    rowTitle.innerText = template.name;
+                    var rowMeta = document.createElement('div');
+                    rowMeta.className = 'setting-meta';
+                    rowMeta.innerText = (template.entity_count || 0) + ' entities';
+                    info.appendChild(rowTitle);
+                    info.appendChild(rowMeta);
+
+                    var useBtn = document.createElement('button');
+                    useBtn.className = 'btn-sm';
+                    useBtn.type = 'button';
+                    useBtn.innerText = 'Use';
+                    useBtn.onclick = function () { useSavedTemplate(template.id); };
+
+                    row.appendChild(info);
+                    row.appendChild(useBtn);
+                    templateList.appendChild(row);
+                });
+
+                categoryItem.appendChild(templateList);
+                templateLibraryContainer.appendChild(categoryItem);
+            });
+        }
+
+        async function loadTemplateLibrary(statusText) {
+            try {
+                var res = await fetch('/template_library');
+                var data = await res.json();
+                renderTemplateLibrary(data);
+                templateLibraryStatus.innerText = statusText
+                    ? statusText
+                    : ((data.template_count || 0) > 0
+                        ? 'Saved templates: ' + data.template_count
+                        : 'No saved templates yet.');
+            } catch (_) {
+                templateLibraryContainer.innerHTML = '<div class="setting-meta">Failed to load template library.</div>';
+                templateLibraryStatus.innerText = 'Failed to load template library.';
+            }
+        }
+
+        async function resolveSavedTemplates(templateIds) {
+            var res = await fetch('/template_library/resolve', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ template_ids: templateIds })
+            });
+            return await res.json();
+        }
+
+        function getSelectionSourceLabel() {
+            if (currentTemplateBundle) return 'saved category';
+            if (!currentTemplate) return 'none';
+            if (currentTemplate.saved_template_id) return 'saved template';
+            return 'current selection';
+        }
+
+        async function useSavedTemplate(templateId) {
+            templateLibraryStatus.innerText = 'Loading saved template...';
+            var data = await resolveSavedTemplates([templateId]);
+            var template = (data.templates || [])[0];
+            if (!template) {
+                templateLibraryStatus.innerText = 'Saved template not found.';
+                return;
+            }
+
+            clearSelectionVisuals();
+            currentTemplate = {
+                cache_id: null,
+                saved_template_id: template.id,
+                name: template.name,
+                category: template.category,
+                group_center: template.group_center,
+                entities: template.entities || [],
+                removable: false,
+            };
+            currentTemplateBundle = null;
+            activeLibraryTemplateId = template.id;
+            activeLibraryCategory = null;
+            renderTemplateLibrary(templateLibraryData);
+            setSelectionButtonsEnabled(true);
+            updateSaveTemplateButton();
+            document.getElementById('extract-result').innerText = JSON.stringify({
+                source: 'saved_template',
+                name: template.name,
+                category: template.category,
+                entity_count: template.entity_count || (template.entities || []).length,
+                group_center: template.group_center,
+            }, null, 2);
+            templateLibraryStatus.innerText = 'Loaded template: ' + template.name;
+        }
+
+        async function useSavedTemplateCategory(categoryName) {
+            var category = (templateLibraryData.categories || []).find(function (item) {
+                return item.name === categoryName;
+            });
+            if (!category || !(category.templates || []).length) {
+                templateLibraryStatus.innerText = 'Category is empty.';
+                return;
+            }
+
+            templateLibraryStatus.innerText = 'Loading category templates...';
+            var data = await resolveSavedTemplates(category.templates.map(function (item) { return item.id; }));
+            var templates = (data.templates || []).map(function (template) {
+                return {
+                    cache_id: null,
+                    saved_template_id: template.id,
+                    name: template.name,
+                    category: template.category,
+                    group_center: template.group_center,
+                    entities: template.entities || [],
+                    removable: false,
+                };
+            });
+            if (!templates.length) {
+                templateLibraryStatus.innerText = 'Category templates not found.';
+                return;
+            }
+
+            clearSelectionVisuals();
+            currentTemplate = null;
+            currentTemplateBundle = {
+                category: categoryName,
+                templates: templates,
+            };
+            activeLibraryTemplateId = null;
+            activeLibraryCategory = categoryName;
+            renderTemplateLibrary(templateLibraryData);
+            setSelectionButtonsEnabled(true);
+            updateSaveTemplateButton();
+            document.getElementById('extract-result').innerText = JSON.stringify({
+                source: 'saved_category',
+                category: categoryName,
+                template_count: templates.length,
+                templates: templates.map(function (template) {
+                    return {
+                        name: template.name,
+                        entity_count: (template.entities || []).length,
+                    };
+                }),
+            }, null, 2);
+            templateLibraryStatus.innerText = 'Loaded category: ' + categoryName;
+        }
+
+        async function saveCurrentTemplate() {
+            if (!currentTemplate || currentTemplateBundle) {
+                templateLibraryStatus.innerText = 'Select a single template before saving.';
+                return;
+            }
+
+            var payload = {
+                name: savedTemplateNameInput.value,
+                category: savedTemplateCategoryInput.value,
+            };
+            if (currentTemplate.template_id && currentTemplate.cache_id) {
+                payload.cache_id = currentTemplate.cache_id;
+                payload.template_id = currentTemplate.template_id;
+            } else {
+                payload.group_center = currentTemplate.group_center || null;
+                payload.entities = currentTemplate.entities || [];
+            }
+
+            templateLibraryStatus.innerText = 'Saving template...';
+            var res = await fetch('/template_library/save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            var data = await res.json();
+            if (!res.ok || data.error) {
+                templateLibraryStatus.innerText = (data && data.error) || 'Failed to save template.';
+                return;
+            }
+
+            savedTemplateNameInput.value = data.saved_template.name || savedTemplateNameInput.value;
+            savedTemplateCategoryInput.value = data.saved_template.category || savedTemplateCategoryInput.value;
+            renderTemplateLibrary(data.library || { categories: [], template_count: 0 });
+            templateLibraryStatus.innerText = 'Saved template: ' + data.saved_template.name;
+        }
+
         function getSelectionPrompt() {
             return selectorMode === 'click'
                 ? 'Upload successful. Click a feature to select it.'
@@ -654,8 +960,11 @@
         }
 
         function setSelectionButtonsEnabled(enabled) {
-            document.getElementById('btn-scan').disabled = !enabled;
-            btnRemoveEntities.disabled = !enabled;
+            var canScan = !!enabled && !!currentCacheId;
+            var canRemove = !!enabled && !!currentCacheId && !!(currentTemplate && currentTemplate.removable);
+            document.getElementById('btn-scan').disabled = !canScan;
+            btnRemoveEntities.disabled = !canRemove;
+            updateSaveTemplateButton();
         }
 
         function setMatchButtonsEnabled(enabled) {
@@ -710,6 +1019,10 @@
         function syncClickSelectionState(note) {
             if (!clickSelections.length) {
                 currentTemplate = null;
+                currentTemplateBundle = null;
+                activeLibraryTemplateId = null;
+                activeLibraryCategory = null;
+                renderTemplateLibrary(templateLibraryData);
                 tmplG.innerHTML = '';
                 setSelectionButtonsEnabled(false);
                 setExtractPreviewFromClickSelection(note);
@@ -721,7 +1034,12 @@
                 cache_id: currentCacheId,
                 group_center: computeGroupCenter(entities),
                 entities: entities,
+                removable: true,
             };
+            currentTemplateBundle = null;
+            activeLibraryTemplateId = null;
+            activeLibraryCategory = null;
+            renderTemplateLibrary(templateLibraryData);
             renderTemplateHighlights(
                 clickSelections
                     .map(function (item) { return item.highlight; })
@@ -845,6 +1163,8 @@
             var matches = data.matches || [];
             var previewMatches = matches.slice(0, previewLimit).map(function (m) {
                 return {
+                    template_name: m.template_name || null,
+                    template_category: m.template_category || null,
                     dxf_x: m.dxf_x,
                     dxf_y: m.dxf_y,
                     render_pct_x: m.render_pct_x,
@@ -855,8 +1175,11 @@
                 };
             });
             var preview = {
+                source: data.source || 'single_template',
+                category: data.category || null,
                 match_count: data.match_count || matches.length,
                 scan_stats: data.scan_stats || null,
+                template_runs: data.template_runs || null,
                 matches_preview: previewMatches,
             };
             var text = JSON.stringify(preview, null, 2);
@@ -1096,6 +1419,7 @@
             if (result.error) {
                 tmplG.innerHTML = '';
                 currentTemplate = null;
+                currentTemplateBundle = null;
                 setSelectionButtonsEnabled(false);
             } else if ((result.entity_count || 0) > 0 && result.template_id) {
                 currentTemplate = {
@@ -1104,12 +1428,18 @@
                     group_center: result.group_center,
                     entity_count: result.entity_count || 0,
                     entities_preview: result.entities_preview || [],
+                    removable: true,
                 };
+                currentTemplateBundle = null;
+                activeLibraryTemplateId = null;
+                activeLibraryCategory = null;
+                renderTemplateLibrary(templateLibraryData);
                 renderTemplateHighlights(result.highlights || []);
                 setSelectionButtonsEnabled(true);
             } else {
                 tmplG.innerHTML = '';
                 currentTemplate = null;
+                currentTemplateBundle = null;
                 document.getElementById('extract-result').innerText += "\n" + getEmptySelectionMessage();
                 setSelectionButtonsEnabled(false);
             }
@@ -1284,14 +1614,28 @@
                 "Removed " + (data.removed_count || 0) + " entities.\n" + getIdleSelectionPrompt();
         }
 
-        function clearPoly(silent) {
-            polyPts = []; polyClosed = false; polyG.innerHTML = '';
+        function clearSelectionVisuals() {
+            polyPts = [];
+            polyClosed = false;
+            polyG.innerHTML = '';
             clickSelections = [];
             tmplG.innerHTML = '';
+            hlG.innerHTML = '';
+            currentMatchResult = null;
+            setMatchButtonsEnabled(false);
+            document.getElementById('scan-status').innerText = '';
+            document.getElementById('scan-result').innerText = 'Waiting for scan...';
+        }
+
+        function clearPoly(silent) {
+            clearSelectionVisuals();
             currentTemplate = null;
+            currentTemplateBundle = null;
+            activeLibraryTemplateId = null;
+            activeLibraryCategory = null;
+            renderTemplateLibrary(templateLibraryData);
             currentMatchResult = null;
             setSelectionButtonsEnabled(false);
-            setMatchButtonsEnabled(false);
             if (!silent) {
                 document.getElementById('extract-result').innerText = "Cleared. " + getIdleSelectionPrompt();
             }
@@ -1313,28 +1657,94 @@
         }
 
         // --- Scan ---
+        function buildScanPayload(templateLike) {
+            var payload = { cache_id: currentCacheId };
+            if (templateLike.template_id && templateLike.cache_id === currentCacheId) {
+                payload.template_id = templateLike.template_id;
+            } else {
+                payload.entities = templateLike.entities || [];
+                payload.group_center = templateLike.group_center || null;
+            }
+            payload.plugins = collectSelectedPlugins();
+            payload.settings = collectRuntimeSettings();
+            return payload;
+        }
+
+        async function executeScanRequest(endpoint, templateLike) {
+            var res = await fetch(endpoint, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(buildScanPayload(templateLike))
+            });
+            return await res.json();
+        }
+
         async function scanTemplate() {
-            if (!currentTemplate || !currentCacheId) return;
+            if ((!currentTemplate && !currentTemplateBundle) || !currentCacheId) return;
             var endpoint = document.querySelector('input[name="scan-mode"]:checked').value;
             document.getElementById('scan-status').innerText = "Scanning...";
             document.getElementById('scan-result').innerText = "";
             hlG.innerHTML = "";
             var t0 = performance.now();
-            var payload = { cache_id: currentCacheId };
-            if (currentTemplate.template_id) {
-                payload.template_id = currentTemplate.template_id;
-            } else {
-                payload.entities = currentTemplate.entities || [];
-                payload.group_center = currentTemplate.group_center || null;
-            }
-            payload.plugins = collectSelectedPlugins();
-            payload.settings = collectRuntimeSettings();
-            var res = await fetch(endpoint, {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-            var data = await res.json();
             var elapsed = ((performance.now() - t0) / 1000).toFixed(2);
+            var data;
+
+            if (currentTemplateBundle && (currentTemplateBundle.templates || []).length) {
+                var runs = [];
+                var combinedMatches = [];
+                for (var i = 0; i < currentTemplateBundle.templates.length; i++) {
+                    var templateLike = currentTemplateBundle.templates[i];
+                    document.getElementById('scan-status').innerText =
+                        'Scanning category ' + currentTemplateBundle.category + ' (' + (i + 1) + '/' + currentTemplateBundle.templates.length + '): ' + templateLike.name;
+                    var runResult = await executeScanRequest(endpoint, templateLike);
+                    if (runResult.error) {
+                        runs.push({
+                            template_name: templateLike.name,
+                            template_category: templateLike.category,
+                            error: runResult.error,
+                        });
+                        continue;
+                    }
+                    (runResult.matches || []).forEach(function (match) {
+                        match.template_name = templateLike.name;
+                        match.template_category = templateLike.category;
+                    });
+                    combinedMatches = combinedMatches.concat(runResult.matches || []);
+                    runs.push({
+                        template_name: templateLike.name,
+                        template_category: templateLike.category,
+                        match_count: runResult.match_count || 0,
+                        scan_stats: runResult.scan_stats || null,
+                    });
+                }
+                combinedMatches.sort(function (a, b) {
+                    var as = a.match_score == null ? Number.POSITIVE_INFINITY : a.match_score;
+                    var bs = b.match_score == null ? Number.POSITIVE_INFINITY : b.match_score;
+                    return as - bs;
+                });
+                data = {
+                    source: 'saved_category',
+                    category: currentTemplateBundle.category,
+                    match_count: combinedMatches.length,
+                    matches: combinedMatches,
+                    template_runs: runs,
+                    scan_stats: {
+                        template_count: currentTemplateBundle.templates.length,
+                        completed_count: runs.filter(function (run) { return !run.error; }).length,
+                        failed_count: runs.filter(function (run) { return !!run.error; }).length,
+                    },
+                };
+            } else {
+                data = await executeScanRequest(endpoint, currentTemplate);
+                if (!data.error && currentTemplate && currentTemplate.name) {
+                    data.source = 'saved_template';
+                    (data.matches || []).forEach(function (match) {
+                        match.template_name = currentTemplate.name;
+                        match.template_category = currentTemplate.category || null;
+                    });
+                }
+            }
+
             if (data.error) {
                 document.getElementById('scan-status').innerText = data.error;
                 document.getElementById('scan-result').innerText = JSON.stringify(data, null, 2);
@@ -1342,7 +1752,12 @@
                 setMatchButtonsEnabled(false);
                 return;
             }
-            document.getElementById('scan-status').innerText = 'Scan complete! Found ' + data.match_count + ' matches (' + elapsed + 's)';
+            if (currentTemplateBundle) {
+                document.getElementById('scan-status').innerText =
+                    'Category scan complete! Found ' + data.match_count + ' matches across ' + (currentTemplateBundle.templates || []).length + ' templates (' + elapsed + 's)';
+            } else {
+                document.getElementById('scan-status').innerText = 'Scan complete! Found ' + data.match_count + ' matches (' + elapsed + 's)';
+            }
             var noHighlightMatches = (data.matches || []).filter(function (m) {
                 return (m.highlight_count_total || 0) > 0 && (m.highlight_count_returned || 0) === 0;
             }).length;

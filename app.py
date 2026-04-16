@@ -1,4 +1,5 @@
 from collections import Counter
+import json
 import math
 import os
 import tempfile
@@ -26,6 +27,7 @@ from shapely.ops import linemerge
 app = FastAPI()
 BASE_DIR = Path(__file__).resolve().parent
 INDEX_HTML_PATH = BASE_DIR / "templates" / "index.html"
+TEMPLATE_LIBRARY_PATH = BASE_DIR / "data" / "template_library.json"
 
 # --- Algorithm constants ---
 SNAP_DECIMALS = 6  # Endpoint rounding precision for stable linemerge stitching
@@ -751,6 +753,7 @@ def extract_template_features(
 # --- Session cache store ---
 _cache_store = {}
 _cache_lock = threading.Lock()
+_template_library_lock = threading.Lock()
 
 
 def _build_cache_payload(msp, *, fast_build=False):
@@ -917,6 +920,192 @@ def _load_extracted_template(cache_id, template_id):
             return None
         payload["last_access"] = now
         return payload.get("templates", {}).get(template_id)
+
+
+def _normalize_template_category(raw_category):
+    text = str(raw_category or "").strip()
+    return text or "Uncategorized"
+
+
+def _default_template_name():
+    return "Template " + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+
+def _sanitize_template_group_center(group_center):
+    if not isinstance(group_center, dict):
+        return None
+    try:
+        x = float(group_center.get("x"))
+        y = float(group_center.get("y"))
+    except (TypeError, ValueError):
+        return None
+    return {"x": round(x, 6), "y": round(y, 6)}
+
+
+def _compute_group_center_from_entities(entities):
+    if not entities:
+        return None
+    return {
+        "x": round(sum(float(e["x"]) for e in entities) / len(entities), 6),
+        "y": round(sum(float(e["y"]) for e in entities) / len(entities), 6),
+    }
+
+
+def _sanitize_template_entities(entities):
+    if not isinstance(entities, list):
+        return []
+    cleaned = []
+    for entity in entities:
+        if not isinstance(entity, dict):
+            continue
+        if not all(key in entity for key in ("type", "size", "x", "y")):
+            continue
+        try:
+            item = {
+                "type": str(entity["type"]),
+                "size": round(float(entity["size"]), 6),
+                "x": round(float(entity["x"]), 6),
+                "y": round(float(entity["y"]), 6),
+            }
+        except (TypeError, ValueError):
+            continue
+        shape_sig = entity.get("shape_sig")
+        if isinstance(shape_sig, dict):
+            item["shape_sig"] = {
+                key: shape_sig[key]
+                for key in ("point_count", "bbox_diag", "aspect_ratio")
+                if key in shape_sig
+            }
+        cleaned.append(item)
+    return cleaned
+
+
+def _read_template_library_locked():
+    TEMPLATE_LIBRARY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not TEMPLATE_LIBRARY_PATH.exists():
+        return {"templates": []}
+    try:
+        raw = json.loads(TEMPLATE_LIBRARY_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"templates": []}
+
+    normalized = []
+    for record in raw.get("templates", []):
+        if not isinstance(record, dict) or not record.get("id"):
+            continue
+        entities = _sanitize_template_entities(record.get("entities"))
+        if not entities:
+            continue
+        group_center = _sanitize_template_group_center(record.get("group_center"))
+        if group_center is None:
+            group_center = _compute_group_center_from_entities(entities)
+        normalized.append(
+            {
+                "id": str(record["id"]),
+                "name": str(record.get("name") or _default_template_name()).strip()
+                or _default_template_name(),
+                "category": _normalize_template_category(record.get("category")),
+                "group_center": group_center,
+                "entities": entities,
+                "created_at": float(record.get("created_at") or 0.0),
+                "updated_at": float(record.get("updated_at") or 0.0),
+            }
+        )
+    return {"templates": normalized}
+
+
+def _write_template_library_locked(library):
+    TEMPLATE_LIBRARY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = TEMPLATE_LIBRARY_PATH.with_suffix(".tmp")
+    tmp_path.write_text(
+        json.dumps(library, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(tmp_path, TEMPLATE_LIBRARY_PATH)
+
+
+def _serialize_saved_template(record, *, include_entities=False):
+    payload = {
+        "id": record["id"],
+        "name": record["name"],
+        "category": record["category"],
+        "group_center": record["group_center"],
+        "entity_count": len(record.get("entities", [])),
+        "created_at": record.get("created_at", 0.0),
+        "updated_at": record.get("updated_at", 0.0),
+    }
+    if include_entities:
+        payload["entities"] = record.get("entities", [])
+    return payload
+
+
+def _build_template_library_response():
+    with _template_library_lock:
+        library = _read_template_library_locked()
+
+    categories = {}
+    for record in sorted(
+        library["templates"],
+        key=lambda item: (
+            item.get("category", "").lower(),
+            item.get("name", "").lower(),
+            item.get("created_at", 0.0),
+        ),
+    ):
+        category = record["category"]
+        categories.setdefault(category, []).append(_serialize_saved_template(record))
+
+    return {
+        "template_count": len(library["templates"]),
+        "categories": [
+            {
+                "name": name,
+                "template_count": len(items),
+                "templates": items,
+            }
+            for name, items in categories.items()
+        ],
+    }
+
+
+def _save_template_library_entry(name, category, group_center, entities):
+    cleaned_entities = _sanitize_template_entities(entities)
+    if not cleaned_entities:
+        return None
+    cleaned_group_center = _sanitize_template_group_center(group_center)
+    if cleaned_group_center is None:
+        cleaned_group_center = _compute_group_center_from_entities(cleaned_entities)
+
+    now = time.time()
+    record = {
+        "id": uuid.uuid4().hex,
+        "name": str(name or "").strip() or _default_template_name(),
+        "category": _normalize_template_category(category),
+        "group_center": cleaned_group_center,
+        "entities": cleaned_entities,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    with _template_library_lock:
+        library = _read_template_library_locked()
+        library["templates"].append(record)
+        _write_template_library_locked(library)
+    return record
+
+
+def _resolve_template_library_entries(template_ids):
+    if not isinstance(template_ids, list):
+        return []
+    wanted = [str(tid) for tid in template_ids if str(tid).strip()]
+    if not wanted:
+        return []
+
+    with _template_library_lock:
+        library = _read_template_library_locked()
+
+    records = {record["id"]: record for record in library["templates"]}
+    return [records[tid] for tid in wanted if tid in records]
 
 
 def _remove_entities_from_cache(cache_id, entities):
@@ -1349,6 +1538,57 @@ async def get_settings_schema():
             for meta in SINGLE_ENTITY_MATCH_PLUGINS.values()
         ],
         "hyperparameters": HYPERPARAMETER_SCHEMA,
+    }
+
+
+@app.get("/template_library")
+async def get_template_library():
+    return _build_template_library_response()
+
+
+@app.post("/template_library/save")
+async def save_template_library(data: dict = Body(...)):
+    cache_id = data.get("cache_id")
+    template_id = data.get("template_id")
+    if template_id:
+        template = _load_extracted_template(cache_id, template_id)
+        if template is None:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "Template not found. Please extract template again."},
+            )
+        group_center = template.get("group_center")
+        entities = template.get("entities", [])
+    else:
+        group_center = data.get("group_center")
+        entities = data.get("entities", [])
+
+    saved = _save_template_library_entry(
+        data.get("name"),
+        data.get("category"),
+        group_center,
+        entities,
+    )
+    if saved is None:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "No valid template entities found to save."},
+        )
+
+    return {
+        "saved_template": _serialize_saved_template(saved),
+        "library": _build_template_library_response(),
+    }
+
+
+@app.post("/template_library/resolve")
+async def resolve_template_library(data: dict = Body(...)):
+    records = _resolve_template_library_entries(data.get("template_ids", []))
+    return {
+        "templates": [
+            _serialize_saved_template(record, include_entities=True)
+            for record in records
+        ]
     }
 
 
