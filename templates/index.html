@@ -375,7 +375,7 @@
     <div class="app-shell">
         <header class="topbar">
             <div class="brand">
-                <h1>PCB CAD Pattern Scanner</h1>
+                <h1>VNAP CAD Pattern Scanner</h1>
                 <p>Upload, select polygon, then scan.</p>
             </div>
             <div class="toolbar">
@@ -387,23 +387,10 @@
                     <label>
                         <input type="checkbox" id="prune-entities"> Filter types
                     </label>
-                    <input
-                        type="text"
-                        id="keep-types"
-                        value="ARC,CIRCLE,ELLIPSE,LINE,LWPOLYLINE,POLYLINE,SPLINE"
-                        placeholder="LINE,CIRCLE,LWPOLYLINE"
-                        style="min-width: 320px;"
-                    >
-                    <input
-                        type="number"
-                        id="remove-top-circle-radii"
-                        min="0"
-                        step="1"
-                        value="0"
-                        placeholder="0"
-                        style="width: 92px;"
-                        title="Remove top N most common circle radii groups"
-                    >
+                    <input type="text" id="keep-types" value="ARC,CIRCLE,ELLIPSE,LINE,LWPOLYLINE,POLYLINE,SPLINE"
+                        placeholder="LINE,CIRCLE,LWPOLYLINE" style="min-width: 320px;">
+                    <input type="number" id="remove-top-circle-radii" min="0" step="1" value="0" placeholder="0"
+                        style="width: 92px;" title="Remove top N most common circle radii groups">
                     <button onclick="uploadDXF()">Upload DXF</button>
                 </div>
                 <div class="toolbar-group">
@@ -415,13 +402,15 @@
                     <button class="btn-sm" onclick="clearPoly()">Clear Selection</button>
                     <button class="btn-sm" onclick="resetView()">Reset View</button>
                     <button class="btn-sm" onclick="cleanHighlight()">Clean Highlight</button>
-                    <button id="btn-remove-entities" class="btn-sm btn-danger" onclick="removeSelectedEntities()" disabled>Remove Selected</button>
-                    <button id="btn-download-matched-dxf" class="btn-sm" onclick="downloadMatchedDXF()" disabled>Download Matched DXF</button>
+                    <button id="btn-remove-entities" class="btn-sm btn-danger" onclick="removeSelectedEntities()"
+                        disabled>Remove Selected</button>
+                    <button id="btn-download-matched-dxf" class="btn-sm" onclick="downloadMatchedDXF()"
+                        disabled>Download Matched DXF</button>
                 </div>
                 <div class="toolbar-group">
                     <span>Scan</span>
-                    <label><input type="radio" name="scan-mode" value="/scan" checked> Standard</label>
-                    <label><input type="radio" name="scan-mode" value="/scan_fast"> Fast</label>
+                    <label><input type="radio" name="scan-mode" value="/scan"> Standard</label>
+                    <label><input type="radio" name="scan-mode" value="/scan_fast" checked> Fast</label>
                     <button id="btn-scan" onclick="scanTemplate()" disabled>Run Scan</button>
                 </div>
             </div>
@@ -475,7 +464,8 @@
             </div>
 
             <div class="floating-hint">
-                <p id="selection-hint" class="hint">Left-click to add vertex. Double-click or click the first point to close. Right-drag to pan. Scroll to zoom. Press ESC to clear.</p>
+                <p id="selection-hint" class="hint">Left-click to add vertex. Double-click or click the first point to
+                    close. Right-drag to pan. Scroll to zoom. Press ESC to clear.</p>
             </div>
         </main>
     </div>
@@ -953,7 +943,7 @@
                         "Remove top circle radii groups: " + (data.remove_top_circle_radii ?? 0),
                         "Removed circle groups: " + (removedCircleGroups || "none"),
                         "DXF entities: " + (data.retained_dxf_entity_count ?? data.dxf_entity_count ?? 0)
-                            + " / " + (data.dxf_entity_count ?? 0),
+                        + " / " + (data.dxf_entity_count ?? 0),
                         "Removed filtered entities: " + (data.removed_entity_count ?? 0),
                         "Removed circles by radius grouping: " + (data.removed_circle_count ?? 0),
                         "Entity count: " + (data.entity_count ?? 0),
