@@ -28,6 +28,10 @@ app = FastAPI()
 BASE_DIR = Path(__file__).resolve().parent
 INDEX_HTML_PATH = BASE_DIR / "templates" / "index.html"
 TEMPLATE_LIBRARY_PATH = BASE_DIR / "data" / "template_library.json"
+NO_STORE_HEADERS = {
+    "Cache-Control": "no-store, max-age=0",
+    "Pragma": "no-cache",
+}
 
 # --- Algorithm constants ---
 SNAP_DECIMALS = 6  # Endpoint rounding precision for stable linemerge stitching
@@ -980,38 +984,130 @@ def _sanitize_template_entities(entities):
     return cleaned
 
 
+def _default_template_library_version_label(timestamp=None):
+    ts = float(timestamp or time.time())
+    return "Version " + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+
+def _normalize_saved_template_record(record):
+    if not isinstance(record, dict) or not record.get("id"):
+        return None
+    entities = _sanitize_template_entities(record.get("entities"))
+    if not entities:
+        return None
+    group_center = _sanitize_template_group_center(record.get("group_center"))
+    if group_center is None:
+        group_center = _compute_group_center_from_entities(entities)
+    created_at = float(record.get("created_at") or 0.0)
+    updated_at = float(record.get("updated_at") or created_at)
+    return {
+        "id": str(record["id"]),
+        "name": str(record.get("name") or _default_template_name()).strip()
+        or _default_template_name(),
+        "category": _normalize_template_category(record.get("category")),
+        "group_center": group_center,
+        "entities": entities,
+        "created_at": created_at,
+        "updated_at": updated_at,
+    }
+
+
+def _normalize_template_library_version(raw_version, fallback_label=None):
+    now = time.time()
+    if not isinstance(raw_version, dict):
+        raw_version = {}
+    created_at = float(raw_version.get("created_at") or now)
+    updated_at = float(raw_version.get("updated_at") or created_at)
+    label = str(
+        raw_version.get("label")
+        or raw_version.get("version_label")
+        or raw_version.get("name")
+        or fallback_label
+        or _default_template_library_version_label(created_at)
+    ).strip() or _default_template_library_version_label(created_at)
+    templates = []
+    for record in raw_version.get("templates", []):
+        normalized = _normalize_saved_template_record(record)
+        if normalized is not None:
+            templates.append(normalized)
+    return {
+        "id": str(
+            raw_version.get("id") or raw_version.get("version_id") or uuid.uuid4().hex
+        ),
+        "label": label,
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "templates": templates,
+    }
+
+
+def _new_empty_template_library_version(label=None):
+    now = time.time()
+    return {
+        "id": uuid.uuid4().hex,
+        "label": str(label or _default_template_library_version_label(now)).strip()
+        or _default_template_library_version_label(now),
+        "created_at": now,
+        "updated_at": now,
+        "templates": [],
+    }
+
+
+def _normalize_template_library_payload(raw):
+    versions = []
+    active_version_id = None
+
+    if isinstance(raw, dict) and isinstance(raw.get("versions"), list):
+        active_version_id = str(raw.get("active_version_id") or "").strip() or None
+        for idx, version in enumerate(raw.get("versions", [])):
+            versions.append(
+                _normalize_template_library_version(
+                    version,
+                    fallback_label="Version " + str(idx + 1),
+                )
+            )
+    else:
+        if isinstance(raw, list):
+            raw_templates = raw
+            raw_version = {"templates": raw_templates}
+        elif isinstance(raw, dict):
+            raw_version = {
+                "id": raw.get("version_id") or raw.get("id"),
+                "label": raw.get("version_label") or raw.get("label"),
+                "created_at": raw.get("created_at"),
+                "updated_at": raw.get("updated_at"),
+                "templates": raw.get("templates", []),
+            }
+        else:
+            raw_version = {"templates": []}
+        version = _normalize_template_library_version(raw_version)
+        versions.append(version)
+        active_version_id = version["id"]
+
+    if not versions:
+        version = _new_empty_template_library_version()
+        versions.append(version)
+        active_version_id = version["id"]
+
+    version_ids = {version["id"] for version in versions}
+    if active_version_id not in version_ids:
+        active_version_id = versions[0]["id"]
+
+    return {
+        "active_version_id": active_version_id,
+        "versions": versions,
+    }
+
+
 def _read_template_library_locked():
     TEMPLATE_LIBRARY_PATH.parent.mkdir(parents=True, exist_ok=True)
     if not TEMPLATE_LIBRARY_PATH.exists():
-        return {"templates": []}
+        return _normalize_template_library_payload({"versions": []})
     try:
         raw = json.loads(TEMPLATE_LIBRARY_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {"templates": []}
-
-    normalized = []
-    for record in raw.get("templates", []):
-        if not isinstance(record, dict) or not record.get("id"):
-            continue
-        entities = _sanitize_template_entities(record.get("entities"))
-        if not entities:
-            continue
-        group_center = _sanitize_template_group_center(record.get("group_center"))
-        if group_center is None:
-            group_center = _compute_group_center_from_entities(entities)
-        normalized.append(
-            {
-                "id": str(record["id"]),
-                "name": str(record.get("name") or _default_template_name()).strip()
-                or _default_template_name(),
-                "category": _normalize_template_category(record.get("category")),
-                "group_center": group_center,
-                "entities": entities,
-                "created_at": float(record.get("created_at") or 0.0),
-                "updated_at": float(record.get("updated_at") or 0.0),
-            }
-        )
-    return {"templates": normalized}
+        return _normalize_template_library_payload({"versions": []})
+    return _normalize_template_library_payload(raw)
 
 
 def _write_template_library_locked(library):
@@ -1039,13 +1135,35 @@ def _serialize_saved_template(record, *, include_entities=False):
     return payload
 
 
-def _build_template_library_response():
-    with _template_library_lock:
-        library = _read_template_library_locked()
+def _serialize_template_library_version(record, *, is_active=False):
+    return {
+        "id": record["id"],
+        "label": record["label"],
+        "template_count": len(record.get("templates", [])),
+        "created_at": record.get("created_at", 0.0),
+        "updated_at": record.get("updated_at", 0.0),
+        "is_active": bool(is_active),
+    }
 
+
+def _get_active_template_library_version(library):
+    active_version_id = library.get("active_version_id")
+    for version in library.get("versions", []):
+        if version["id"] == active_version_id:
+            return version
+    if library.get("versions"):
+        library["active_version_id"] = library["versions"][0]["id"]
+        return library["versions"][0]
+    version = _new_empty_template_library_version()
+    library["versions"] = [version]
+    library["active_version_id"] = version["id"]
+    return version
+
+
+def _build_template_library_categories(templates):
     categories = {}
     for record in sorted(
-        library["templates"],
+        templates,
         key=lambda item: (
             item.get("category", "").lower(),
             item.get("name", "").lower(),
@@ -1054,18 +1172,46 @@ def _build_template_library_response():
     ):
         category = record["category"]
         categories.setdefault(category, []).append(_serialize_saved_template(record))
+    return [
+        {
+            "name": name,
+            "template_count": len(items),
+            "templates": items,
+        }
+        for name, items in categories.items()
+    ]
+
+
+def _build_template_library_response():
+    with _template_library_lock:
+        library = _read_template_library_locked()
+    active_version = _get_active_template_library_version(library)
 
     return {
-        "template_count": len(library["templates"]),
-        "categories": [
-            {
-                "name": name,
-                "template_count": len(items),
-                "templates": items,
-            }
-            for name, items in categories.items()
+        "active_version_id": active_version["id"],
+        "active_version_label": active_version["label"],
+        "version_count": len(library["versions"]),
+        "versions": [
+            _serialize_template_library_version(
+                version, is_active=(version["id"] == active_version["id"])
+            )
+            for version in sorted(
+                library["versions"],
+                key=lambda item: item.get("created_at", 0.0),
+                reverse=True,
+            )
         ],
+        "template_count": len(active_version["templates"]),
+        "categories": _build_template_library_categories(active_version["templates"]),
     }
+
+
+def _template_library_json_response(payload, *, status_code=200):
+    return JSONResponse(
+        status_code=status_code,
+        content=payload,
+        headers=NO_STORE_HEADERS,
+    )
 
 
 def _save_template_library_entry(name, category, group_center, entities):
@@ -1089,7 +1235,9 @@ def _save_template_library_entry(name, category, group_center, entities):
 
     with _template_library_lock:
         library = _read_template_library_locked()
-        library["templates"].append(record)
+        active_version = _get_active_template_library_version(library)
+        active_version["templates"].append(record)
+        active_version["updated_at"] = now
         _write_template_library_locked(library)
     return record
 
@@ -1104,8 +1252,114 @@ def _resolve_template_library_entries(template_ids):
     with _template_library_lock:
         library = _read_template_library_locked()
 
-    records = {record["id"]: record for record in library["templates"]}
+    active_version = _get_active_template_library_version(library)
+    records = {record["id"]: record for record in active_version["templates"]}
     return [records[tid] for tid in wanted if tid in records]
+
+
+def _select_template_library_version(version_id):
+    with _template_library_lock:
+        library = _read_template_library_locked()
+        version_ids = {version["id"] for version in library["versions"]}
+        if version_id not in version_ids:
+            return None
+        library["active_version_id"] = version_id
+        _write_template_library_locked(library)
+    return library
+
+
+def _delete_template_library_template(template_id):
+    with _template_library_lock:
+        library = _read_template_library_locked()
+        active_version = _get_active_template_library_version(library)
+        kept = [
+            template
+            for template in active_version.get("templates", [])
+            if template.get("id") != template_id
+        ]
+        if len(kept) == len(active_version.get("templates", [])):
+            return None
+        active_version["templates"] = kept
+        active_version["updated_at"] = time.time()
+        _write_template_library_locked(library)
+    return library
+
+
+def _delete_template_library_version(version_id):
+    with _template_library_lock:
+        library = _read_template_library_locked()
+        kept = [
+            version
+            for version in library.get("versions", [])
+            if version.get("id") != version_id
+        ]
+        if len(kept) == len(library.get("versions", [])):
+            return None
+        if not kept:
+            new_version = _new_empty_template_library_version()
+            kept = [new_version]
+            library["active_version_id"] = new_version["id"]
+        elif library.get("active_version_id") == version_id:
+            library["active_version_id"] = kept[0]["id"]
+        library["versions"] = kept
+        _write_template_library_locked(library)
+    return library
+
+
+def _import_template_library_versions(raw):
+    imported = _normalize_template_library_payload(raw)
+    with _template_library_lock:
+        library = _read_template_library_locked()
+        active_version = _get_active_template_library_version(library)
+        if (
+            len(library["versions"]) == 1
+            and not active_version.get("templates")
+            and active_version["id"] == library.get("active_version_id")
+        ):
+            library["versions"] = []
+            library["active_version_id"] = None
+
+        old_to_new_version_ids = {}
+        imported_versions = []
+        for version in imported["versions"]:
+            cloned_templates = [
+                dict(template, entities=list(template.get("entities", [])))
+                for template in version.get("templates", [])
+            ]
+            new_version_id = uuid.uuid4().hex
+            old_to_new_version_ids[version["id"]] = new_version_id
+            imported_versions.append(
+                {
+                    "id": new_version_id,
+                    "label": version["label"],
+                    "created_at": float(version.get("created_at") or time.time()),
+                    "updated_at": float(
+                        version.get("updated_at")
+                        or version.get("created_at")
+                        or time.time()
+                    ),
+                    "templates": cloned_templates,
+                }
+            )
+
+        library["versions"].extend(imported_versions)
+        active_version_id = old_to_new_version_ids.get(imported["active_version_id"])
+        if active_version_id:
+            library["active_version_id"] = active_version_id
+        elif imported_versions:
+            library["active_version_id"] = imported_versions[-1]["id"]
+        _write_template_library_locked(library)
+    return library, imported_versions
+
+
+def _build_exportable_template_library_version(version):
+    return {
+        "version_id": version["id"],
+        "version_label": version["label"],
+        "created_at": version.get("created_at", 0.0),
+        "updated_at": version.get("updated_at", 0.0),
+        "templates": version.get("templates", []),
+    }
 
 
 def _remove_entities_from_cache(cache_id, entities):
@@ -1522,7 +1776,11 @@ register_single_entity_plugin(
 
 @app.get("/", response_class=FileResponse)
 async def read_root():
-    return FileResponse(INDEX_HTML_PATH, media_type="text/html")
+    return FileResponse(
+        INDEX_HTML_PATH,
+        media_type="text/html",
+        headers=NO_STORE_HEADERS,
+    )
 
 
 @app.get("/settings_schema")
@@ -1543,7 +1801,96 @@ async def get_settings_schema():
 
 @app.get("/template_library")
 async def get_template_library():
-    return _build_template_library_response()
+    return _template_library_json_response(_build_template_library_response())
+
+
+@app.get("/template_library/download")
+async def download_template_library():
+    with _template_library_lock:
+        library = _read_template_library_locked()
+        active_version = _get_active_template_library_version(library)
+        export_payload = _build_exportable_template_library_version(active_version)
+    export_text = json.dumps(export_payload, ensure_ascii=False, indent=2)
+    timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    safe_label = (
+        "".join(
+            ch.lower() if ch.isalnum() else "_" for ch in active_version["label"]
+        ).strip("_")
+        or "template_library"
+    )
+    tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+    tmp_path = tmp.name
+    tmp.write(export_text.encode("utf-8"))
+    tmp.close()
+    return FileResponse(
+        tmp_path,
+        media_type="application/json",
+        filename=f"{safe_label}_{timestamp}.json",
+        background=BackgroundTask(
+            lambda: os.path.exists(tmp_path) and os.remove(tmp_path)
+        ),
+    )
+
+
+@app.post("/template_library/upload")
+async def upload_template_library(file: UploadFile = File(...)):
+    raw = await file.read()
+    if not raw:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Empty upload."},
+        )
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Invalid JSON file."},
+        )
+
+    library, imported_versions = _import_template_library_versions(payload)
+    return {
+        "status": "success",
+        "imported_version_count": len(imported_versions),
+        "template_count": sum(
+            len(version.get("templates", [])) for version in imported_versions
+        ),
+        "library": _build_template_library_response(),
+    }
+
+
+@app.post("/template_library/select_version")
+async def select_template_library_version(data: dict = Body(...)):
+    version_id = str(data.get("version_id") or "").strip()
+    if not version_id:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Missing version_id."},
+        )
+    library = _select_template_library_version(version_id)
+    if library is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Template library version not found."},
+        )
+    return _template_library_json_response(_build_template_library_response())
+
+
+@app.post("/template_library/delete_version")
+async def delete_template_library_version(data: dict = Body(...)):
+    version_id = str(data.get("version_id") or "").strip()
+    if not version_id:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Missing version_id."},
+        )
+    library = _delete_template_library_version(version_id)
+    if library is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Template library version not found."},
+        )
+    return _template_library_json_response(_build_template_library_response())
 
 
 @app.post("/template_library/save")
@@ -1575,10 +1922,29 @@ async def save_template_library(data: dict = Body(...)):
             content={"error": "No valid template entities found to save."},
         )
 
-    return {
-        "saved_template": _serialize_saved_template(saved),
-        "library": _build_template_library_response(),
-    }
+    return _template_library_json_response(
+        {
+            "saved_template": _serialize_saved_template(saved),
+            "library": _build_template_library_response(),
+        }
+    )
+
+
+@app.post("/template_library/delete_template")
+async def delete_template_library_template(data: dict = Body(...)):
+    template_id = str(data.get("template_id") or "").strip()
+    if not template_id:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Missing template_id."},
+        )
+    library = _delete_template_library_template(template_id)
+    if library is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Template not found in active version."},
+        )
+    return _template_library_json_response(_build_template_library_response())
 
 
 @app.post("/template_library/resolve")
