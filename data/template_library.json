@@ -1,0 +1,44 @@
+{
+  "active_version_id": "dd64aa24e6bb4b32b171a1134b244e3d",
+  "versions": [
+    {
+      "id": "dd64aa24e6bb4b32b171a1134b244e3d",
+      "label": "Version 2026-04-17 08:01:27",
+      "created_at": 1776384087.1810791,
+      "updated_at": 1776384351.671531,
+      "templates": [
+        {
+          "id": "562b8b9c4a574d45beb786d5501dec95",
+          "name": "Template 2026-04-17 08:04:04",
+          "category": "Uncategorized",
+          "group_center": {
+            "x": 485.559,
+            "y": 113.644
+          },
+          "entities": [
+            {
+              "type": "CIRCLE",
+              "size": 0.75,
+              "x": 482.059,
+              "y": 110.977
+            },
+            {
+              "type": "CIRCLE",
+              "size": 0.75,
+              "x": 489.559,
+              "y": 113.227
+            },
+            {
+              "type": "CIRCLE",
+              "size": 2.0,
+              "x": 485.059,
+              "y": 116.727
+            }
+          ],
+          "created_at": 1776384244.437732,
+          "updated_at": 1776384244.437732
+        }
+      ]
+    }
+  ]
+}
