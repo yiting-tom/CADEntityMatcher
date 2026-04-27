@@ -1792,6 +1792,16 @@
         function drawTemplateLabel(anchor, label) {
             if (!anchor) return;
             var NS = "http://www.w3.org/2000/svg";
+            var dot = document.createElementNS(NS, "circle");
+            dot.setAttribute("cx", anchor.x);
+            dot.setAttribute("cy", anchor.y);
+            dot.setAttribute("r", Math.max(3 / scale, 1.25));
+            dot.setAttribute("fill", "#0b5d2a");
+            dot.setAttribute("stroke", "white");
+            dot.setAttribute("stroke-width", 1.5 / scale);
+            dot.setAttribute("pointer-events", "none");
+            tmplG.appendChild(dot);
+
             var text = document.createElementNS(NS, "text");
             var fontSize = Math.max(10 / scale, 1.5);
             text.setAttribute("x", anchor.x + 6 / scale);
