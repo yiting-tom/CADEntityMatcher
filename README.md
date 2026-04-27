@@ -7,7 +7,16 @@ FastAPI-based DXF pattern scanner with a full-screen web UI for:
 - Removing selected entities from the current cache
 - Running standard or fast template matching
 - Downloading matched results as DXF
+- Downloading matched result handles as JSON
 - Saving reusable templates into a versioned JSON library
+
+Line-like DXF entities are fingerprinted per source entity. The scanner does not
+globally merge neighboring lines before matching, so matched pattern entity counts
+stay aligned with the selected template entities.
+
+Block references (`INSERT`) are expanded into selectable virtual entities, and
+unsupported drawable DXF entities fall back to a bounding-box fingerprint so SVG
+content is less likely to be visible but unselectable.
 
 ## Stack
 
@@ -49,7 +58,7 @@ Open `http://127.0.0.1:8000`.
 6. Run `Scan` with either:
    - `Fast`
    - `Standard`
-7. Export matched results with `Download Matched DXF`.
+7. Export matched results with `Download Matched DXF` or `Download Matches JSON`.
 
 ## Selection and Editing
 

@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Callable
 import numpy as np
@@ -20,8 +21,8 @@ from ezdxf.bbox import extents
 from ezdxf.addons.drawing import Frontend, RenderContext, layout
 from ezdxf.addons.drawing.config import Configuration
 from ezdxf.addons.drawing.svg import SVGBackend
+from ezdxf.math import Matrix44
 from shapely.geometry import Point, LineString, Polygon as ShapelyPolygon
-from shapely.ops import linemerge
 
 # Initialize FastAPI app
 app = FastAPI()
@@ -34,7 +35,7 @@ NO_STORE_HEADERS = {
 }
 
 # --- Algorithm constants ---
-SNAP_DECIMALS = 6  # Endpoint rounding precision for stable linemerge stitching
+SNAP_DECIMALS = 6  # Coordinate rounding precision for stable geometry fingerprints
 SIZE_TOL_RATIO = 0.05  # Relative size tolerance ratio (5%)
 SIZE_TOL_MIN = 0.05  # Minimum absolute size tolerance
 DIST_TOL_RATIO = 0.05  # Relative distance tolerance ratio (5%)
@@ -62,6 +63,8 @@ CLIENT_MATCHES_PREVIEW_DEFAULT = 80
 CLIENT_POLYLINE_POINTS_DRAW_DEFAULT = 400
 CLICK_PICK_TOL_RATIO = 0.003
 CLICK_PICK_TOL_MIN = 0.25
+BOUNDS_EPS = 1e-9
+MAX_INSERT_EXPLODE_DEPTH = 8
 MATCH_SCORE_MAX_DEFAULT = 0.40
 MATCH_SCORE_ANCHOR_WEIGHT = 0.30
 MATCH_SCORE_SIZE_WEIGHT = 0.45
@@ -336,7 +339,7 @@ HYPERPARAMETER_SCHEMA = [
 
 
 def snap(val):
-    """Round coordinates to fixed precision for stable linemerge endpoints."""
+    """Round coordinates to fixed precision for stable geometry fingerprints."""
     return round(val, SNAP_DECIMALS)
 
 
@@ -454,22 +457,60 @@ def calculate_distance(p1, p2):
     return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
 
 
-def geometry_to_render_pct(geom, bounds):
+def _matrix_from_flat(raw):
+    if not raw:
+        return None
+    try:
+        return Matrix44([float(v) for v in raw])
+    except Exception:
+        return None
+
+
+def _dxf_point_to_render_pct(point, bounds, render_mapping=None):
+    mapping = render_mapping or {}
+    matrix = _matrix_from_flat(mapping.get("matrix"))
+    viewbox_x = mapping.get("viewbox_x")
+    viewbox_y = mapping.get("viewbox_y")
+    viewbox_w = mapping.get("viewbox_w")
+    viewbox_h = mapping.get("viewbox_h")
+    if matrix and viewbox_w and viewbox_h:
+        try:
+            p = matrix.transform((float(point[0]), float(point[1]), 0.0))
+            return [
+                (float(p[0]) - float(viewbox_x or 0.0)) / float(viewbox_w),
+                (float(p[1]) - float(viewbox_y or 0.0)) / float(viewbox_h),
+            ]
+        except Exception:
+            pass
+    return [
+        (point[0] - bounds["min_x"]) / bounds["width"],
+        (bounds["max_y"] - point[1]) / bounds["height"],
+    ]
+
+
+def geometry_to_render_pct(geom, bounds, render_mapping=None):
     """Convert DXF geometry coordinates to SVG render percentage coordinates."""
     w, h = bounds["width"], bounds["height"]
     min_x, max_y = bounds["min_x"], bounds["max_y"]
     if geom["kind"] == "circle":
+        center_pct = _dxf_point_to_render_pct(
+            (geom["cx"], geom["cy"]), bounds, render_mapping
+        )
+        edge_pct = _dxf_point_to_render_pct(
+            (geom["cx"] + geom["r"], geom["cy"]), bounds, render_mapping
+        )
         return {
             "kind": "circle",
-            "cx_pct": (geom["cx"] - min_x) / w,
-            "cy_pct": (max_y - geom["cy"]) / h,
-            "r_pct": geom["r"] / w,
+            "cx_pct": center_pct[0],
+            "cy_pct": center_pct[1],
+            "r_pct": abs(edge_pct[0] - center_pct[0]) or geom["r"] / w,
         }
     else:  # polyline
         return {
             "kind": "polyline",
             "points_pct": [
-                [(px - min_x) / w, (max_y - py) / h] for px, py in geom["points"]
+                _dxf_point_to_render_pct((px, py), bounds, render_mapping)
+                for px, py in geom["points"]
             ],
         }
 
@@ -493,20 +534,40 @@ def _compact_render_highlight(h):
     return compact
 
 
-def get_dxf_bounds(msp):
-    """Get DXF extents and dimensions."""
-    ext = extents(msp)
+def _make_bounds(min_x, min_y, max_x, max_y):
+    width = max(float(max_x) - float(min_x), BOUNDS_EPS)
+    height = max(float(max_y) - float(min_y), BOUNDS_EPS)
     return {
-        "min_x": ext.extmin.x,
-        "min_y": ext.extmin.y,
-        "max_x": ext.extmax.x,
-        "max_y": ext.extmax.y,
-        "width": ext.extmax.x - ext.extmin.x,
-        "height": ext.extmax.y - ext.extmin.y,
+        "min_x": float(min_x),
+        "min_y": float(min_y),
+        "max_x": float(max_x),
+        "max_y": float(max_y),
+        "width": width,
+        "height": height,
     }
 
 
-def _render_pct_to_dxf_point(pt, bounds):
+def get_dxf_bounds(msp):
+    """Get DXF extents and dimensions."""
+    ext = extents(msp)
+    return _make_bounds(ext.extmin.x, ext.extmin.y, ext.extmax.x, ext.extmax.y)
+
+
+def _render_pct_to_dxf_point(pt, bounds, render_mapping=None):
+    mapping = render_mapping or {}
+    inv = _matrix_from_flat(mapping.get("inv_matrix"))
+    viewbox_x = mapping.get("viewbox_x")
+    viewbox_y = mapping.get("viewbox_y")
+    viewbox_w = mapping.get("viewbox_w")
+    viewbox_h = mapping.get("viewbox_h")
+    if inv and viewbox_w and viewbox_h:
+        try:
+            x_vb = float(viewbox_x or 0.0) + float(pt[0]) * float(viewbox_w)
+            y_vb = float(viewbox_y or 0.0) + float(pt[1]) * float(viewbox_h)
+            p = inv.transform((x_vb, y_vb, 0.0))
+            return (float(p[0]), float(p[1]))
+        except Exception:
+            pass
     return (
         bounds["min_x"] + pt[0] * bounds["width"],
         bounds["max_y"] - pt[1] * bounds["height"],
@@ -534,7 +595,10 @@ def _extract_entities_from_polygon(cache_payload, polygon_pct):
     if len(polygon_pct) < 3:
         return []
     bounds = cache_payload["bounds"]
-    dxf_vertices = [_render_pct_to_dxf_point(pt, bounds) for pt in polygon_pct]
+    render_mapping = cache_payload.get("render_mapping")
+    dxf_vertices = [
+        _render_pct_to_dxf_point(pt, bounds, render_mapping) for pt in polygon_pct
+    ]
     roi_polygon = ShapelyPolygon(dxf_vertices)
     return [
         f
@@ -547,7 +611,8 @@ def _extract_entities_from_click(cache_payload, click_pct):
     if not isinstance(click_pct, list) or len(click_pct) < 2:
         return []
     bounds = cache_payload["bounds"]
-    pick_point = Point(*_render_pct_to_dxf_point(click_pct, bounds))
+    render_mapping = cache_payload.get("render_mapping")
+    pick_point = Point(*_render_pct_to_dxf_point(click_pct, bounds, render_mapping))
     pick_tol = max(
         CLICK_PICK_TOL_MIN,
         max(bounds["width"], bounds["height"]) * CLICK_PICK_TOL_RATIO,
@@ -572,7 +637,12 @@ def _extract_entities_from_click(cache_payload, click_pct):
 
 
 def _build_extract_response(
-    cache_id, bounds, entities_found, selector_mode, runtime_config=None
+    cache_id,
+    bounds,
+    entities_found,
+    selector_mode,
+    runtime_config=None,
+    render_mapping=None,
 ):
     config = runtime_config or DEFAULT_RUNTIME_CONFIG
     highlight_limit = int(config["extract_highlights_return_limit"])
@@ -582,6 +652,7 @@ def _build_extract_response(
             "selector_mode": selector_mode,
             "entities": [],
             "highlights": [],
+            "highlight_labels": [],
         }
 
     group_cx = sum(e["x"] for e in entities_found) / len(entities_found)
@@ -598,10 +669,20 @@ def _build_extract_response(
         cache_id, template_payload["group_center"], entities_clean
     )
     all_highlights = [
-        geometry_to_render_pct(e["geometry"], bounds) for e in entities_found
+        geometry_to_render_pct(e["geometry"], bounds, render_mapping)
+        for e in entities_found
     ]
     highlights = [
         _compact_render_highlight(h) for h in all_highlights[:highlight_limit]
+    ]
+    highlight_labels = [
+        {
+            "handleIDs": entity.get("handleIDs", []),
+            "x": entity.get("x"),
+            "y": entity.get("y"),
+            "type": entity.get("type"),
+        }
+        for entity in entities_clean[:highlight_limit]
     ]
 
     return {
@@ -612,6 +693,7 @@ def _build_extract_response(
         "entity_count": len(entities_clean),
         "entities_preview": entities_clean[:preview_limit],
         "highlights": highlights,
+        "highlight_labels": highlight_labels,
         "highlight_count_total": len(all_highlights),
         "highlight_count_returned": len(highlights),
         "highlight_truncated": len(all_highlights) > len(highlights),
@@ -635,25 +717,111 @@ def _polyline_shape_signature(points):
     }
 
 
+def _entity_handle_id(entity):
+    handle = getattr(entity.dxf, "handle", None)
+    return str(handle) if handle is not None else None
+
+
+def _unique_handle_ids(handle_ids):
+    seen = set()
+    unique = []
+    for handle_id in handle_ids:
+        if not handle_id or handle_id in seen:
+            continue
+        seen.add(handle_id)
+        unique.append(handle_id)
+    return unique
+
+
+def _composite_feature_from_entity(geom, handle_id):
+    centroid = geom.centroid
+    return {
+        "type": "COMPOSITE_SHAPE",
+        "size": round(geom.length, 3),
+        "x": round(centroid.x, 3),
+        "y": round(centroid.y, 3),
+        "shape_sig": _polyline_shape_signature(list(geom.coords)),
+        "geometry": {
+            "kind": "polyline",
+            "points": [list(c) for c in geom.coords],
+        },
+        "handleIDs": [handle_id] if handle_id else [],
+    }
+
+
+def _bbox_feature_from_entity(entity, handle_id):
+    try:
+        box = extents([entity])
+        if not box.has_data:
+            return None
+        min_x, min_y = box.extmin.x, box.extmin.y
+        max_x, max_y = box.extmax.x, box.extmax.y
+    except Exception:
+        return None
+    width = max_x - min_x
+    height = max_y - min_y
+    if abs(width) <= BOUNDS_EPS and abs(height) <= BOUNDS_EPS:
+        return None
+    points = [
+        [min_x, min_y],
+        [max_x, min_y],
+        [max_x, max_y],
+        [min_x, max_y],
+        [min_x, min_y],
+    ]
+    return {
+        "type": entity.dxftype(),
+        "size": round(math.hypot(width, height), 3),
+        "x": round((min_x + max_x) / 2, 3),
+        "y": round((min_y + max_y) / 2, 3),
+        "geometry": {
+            "kind": "polyline",
+            "points": points,
+        },
+        "handleIDs": [handle_id] if handle_id else [],
+    }
+
+
+def _iter_flat_entities(entities, *, depth=0, max_depth=MAX_INSERT_EXPLODE_DEPTH):
+    """Yield drawable entities, expanding INSERT block references recursively."""
+    if depth > max_depth:
+        return
+    for entity in entities:
+        handle_id = _entity_handle_id(entity)
+        if entity.dxftype() == "INSERT":
+            if depth >= max_depth:
+                continue
+            try:
+                for child, child_handle_id in _iter_flat_entities(
+                    entity.virtual_entities(),
+                    depth=depth + 1,
+                    max_depth=max_depth,
+                ):
+                    yield child, child_handle_id or handle_id
+            except Exception:
+                continue
+            continue
+        yield entity, handle_id
+
+
 def extract_template_features(
     msp, roi_box=None, *, flatten_tol=DEFAULT_FLATTEN_TOL, skip_ellipse_spline=False
 ):
     """
     Smart feature extraction v2:
-    1. Always run global linemerge on the whole drawing for topology consistency.
+    1. Preserve one fingerprint per source DXF entity.
     2. Supports CIRCLE, LINE, LWPOLYLINE, ARC, POLYLINE, ELLIPSE, SPLINE.
-    3. Snap endpoints to improve linemerge stability.
+    3. Snap sampled coordinates for stable shape signatures.
     4. Apply ROI filtering last (centroid must be inside ROI).
     """
-    circles = []
-    all_lines = []
+    features = []
 
-    for entity in msp:
+    for entity, handle_id in _iter_flat_entities(msp):
         etype = entity.dxftype()
 
         if etype == "CIRCLE":
             cx, cy = entity.dxf.center.x, entity.dxf.center.y
-            circles.append(
+            features.append(
                 {
                     "type": "CIRCLE",
                     "size": round(entity.dxf.radius, 3),
@@ -665,21 +833,22 @@ def extract_template_features(
                         "cy": cy,
                         "r": entity.dxf.radius,
                     },
+                    "handleIDs": [handle_id] if handle_id else [],
                 }
             )
 
         elif etype == "LINE":
             p1, p2 = entity.dxf.start, entity.dxf.end
-            all_lines.append(
-                LineString([(snap(p1.x), snap(p1.y)), (snap(p2.x), snap(p2.y))])
-            )
+            geom = LineString([(snap(p1.x), snap(p1.y)), (snap(p2.x), snap(p2.y))])
+            features.append(_composite_feature_from_entity(geom, handle_id))
 
         elif etype == "LWPOLYLINE":
             pts = [(snap(p[0]), snap(p[1])) for p in entity.get_points()]
             if entity.is_closed and len(pts) >= 3:
                 pts.append(pts[0])
             if len(pts) >= 2:
-                all_lines.append(LineString(pts))
+                geom = LineString(pts)
+                features.append(_composite_feature_from_entity(geom, handle_id))
 
         elif etype == "ARC":
             center = entity.dxf.center
@@ -696,7 +865,8 @@ def extract_template_features(
                 )
                 for i in range(n + 1)
             ]
-            all_lines.append(LineString(pts))
+            geom = LineString(pts)
+            features.append(_composite_feature_from_entity(geom, handle_id))
 
         elif etype == "POLYLINE":
             try:
@@ -707,7 +877,8 @@ def extract_template_features(
                 if entity.is_closed and len(pts) >= 3:
                     pts.append(pts[0])
                 if len(pts) >= 2:
-                    all_lines.append(LineString(pts))
+                    geom = LineString(pts)
+                    features.append(_composite_feature_from_entity(geom, handle_id))
             except Exception:
                 pass
 
@@ -717,35 +888,15 @@ def extract_template_features(
             try:
                 pts = [(snap(p.x), snap(p.y)) for p in entity.flattening(flatten_tol)]
                 if len(pts) >= 2:
-                    all_lines.append(LineString(pts))
+                    geom = LineString(pts)
+                    features.append(_composite_feature_from_entity(geom, handle_id))
             except Exception:
                 pass
 
-    # --- Global linemerge: always merge the full drawing for consistent topology ---
-    features = list(circles)
-    if all_lines:
-        merged_result = linemerge(all_lines)
-
-        if merged_result.geom_type in ("LineString", "LinearRing"):
-            merged_geoms = [merged_result]
         else:
-            merged_geoms = list(merged_result.geoms)
-
-        for geom in merged_geoms:
-            centroid = geom.centroid
-            features.append(
-                {
-                    "type": "COMPOSITE_SHAPE",
-                    "size": round(geom.length, 3),
-                    "x": round(centroid.x, 3),
-                    "y": round(centroid.y, 3),
-                    "shape_sig": _polyline_shape_signature(list(geom.coords)),
-                    "geometry": {
-                        "kind": "polyline",
-                        "points": [list(c) for c in geom.coords],
-                    },
-                }
-            )
+            fallback = _bbox_feature_from_entity(entity, handle_id)
+            if fallback is not None:
+                features.append(fallback)
 
     # --- ROI filtering: keep features whose centroids are inside ROI ---
     if roi_box is not None:
@@ -760,7 +911,7 @@ _cache_lock = threading.Lock()
 _template_library_lock = threading.Lock()
 
 
-def _build_cache_payload(msp, *, fast_build=False):
+def _build_cache_payload(msp, *, fast_build=False, render_mapping=None):
     """Build cache payload (fingerprints + spatial indexes) for one upload."""
     bounds = get_dxf_bounds(msp)
     flatten_tol = FAST_FLATTEN_TOL if fast_build else DEFAULT_FLATTEN_TOL
@@ -796,6 +947,7 @@ def _build_cache_payload(msp, *, fast_build=False):
         "tree": tree,
         "type_index": type_index,
         "templates": {},
+        "render_mapping": render_mapping,
         "fast_build": fast_build,
         "flatten_tol": flatten_tol,
         "created_at": now,
@@ -2005,10 +2157,41 @@ async def upload_dxf(
     Frontend(RenderContext(doc), backend, config=render_config).draw_layout(msp)
     page = layout.Page(0, 0, layout.Units.mm)
     svg = backend.get_string(page)
+    render_mapping = None
+    try:
+        matrix = backend.transformation_matrix
+        inv = matrix.copy()
+        inv.inverse()
+        root = ET.fromstring(svg)
+        vb = (root.get("viewBox") or "").strip().split()
+        if len(vb) == 4:
+            viewbox_x = float(vb[0])
+            viewbox_y = float(vb[1])
+            viewbox_w = float(vb[2])
+            viewbox_h = float(vb[3])
+            if viewbox_w > 0 and viewbox_h > 0:
+                render_mapping = {
+                    "matrix": [
+                        float(v) for row in matrix.rows() for v in row
+                    ],
+                    "inv_matrix": [
+                        float(v) for row in inv.rows() for v in row
+                    ],
+                    "viewbox_x": viewbox_x,
+                    "viewbox_y": viewbox_y,
+                    "viewbox_w": viewbox_w,
+                    "viewbox_h": viewbox_h,
+                }
+    except Exception:
+        render_mapping = None
     svg_render_time_ms = int((time.perf_counter() - t0) * 1000)
 
     t1 = time.perf_counter()
-    cache_payload = _build_cache_payload(msp, fast_build=fast_build)
+    cache_payload = _build_cache_payload(
+        msp,
+        fast_build=fast_build,
+        render_mapping=render_mapping,
+    )
     cache_build_time_ms = int((time.perf_counter() - t1) * 1000)
     cache_id = _store_cache(cache_payload)
     return {
@@ -2024,6 +2207,11 @@ async def upload_dxf(
         "removed_circle_count": removed_circle_count,
         "removed_circle_groups": removed_circle_groups,
         "entity_count": len(cache_payload["fingerprints"]),
+        "coord_basis": (
+            "render_matrix"
+            if render_mapping
+            else "dxf_extents"
+        ),
         "svg_render_time_ms": svg_render_time_ms,
         "cache_build_time_ms": cache_build_time_ms,
         "svg": svg,
@@ -2046,6 +2234,7 @@ async def extract_template(data: dict = Body(...)):
     click_pct = data.get("click_pct")
     runtime_config = _coerce_runtime_config(data.get("settings"))
     bounds = cache_payload["bounds"]
+    render_mapping = cache_payload.get("render_mapping")
     if isinstance(click_pct, list) and len(click_pct) >= 2:
         entities_found = _extract_entities_from_click(cache_payload, click_pct)
         return _build_extract_response(
@@ -2054,6 +2243,7 @@ async def extract_template(data: dict = Body(...)):
             entities_found,
             "click",
             runtime_config=runtime_config,
+            render_mapping=render_mapping,
         )
 
     entities_found = _extract_entities_from_polygon(cache_payload, polygon_pct)
@@ -2063,6 +2253,7 @@ async def extract_template(data: dict = Body(...)):
         entities_found,
         "polygon",
         runtime_config=runtime_config,
+        render_mapping=render_mapping,
     )
 
 
@@ -2125,7 +2316,9 @@ async def remove_entities(data: dict = Body(...)):
 
     removed_highlights = [
         _compact_render_highlight(
-            geometry_to_render_pct(f["geometry"], payload["bounds"])
+            geometry_to_render_pct(
+                f["geometry"], payload["bounds"], payload.get("render_mapping")
+            )
         )
         for f in removed[:MAX_EXTRACT_HIGHLIGHTS_RETURN]
     ]
@@ -2246,6 +2439,7 @@ def _build_match(
     *,
     max_highlights=MAX_SCAN_HIGHLIGHTS_RETURN,
     match_score=None,
+    render_mapping=None,
 ):
     """Shared match result builder. Anchor can be int(index) or dict(feature)."""
     if isinstance(anchor_idx_or_feat, (int, np.integer)):
@@ -2262,13 +2456,19 @@ def _build_match(
     else:
         mcx, mcy = cx, cy
 
-    rpx = (mcx - bounds["min_x"]) / bounds["width"]
-    rpy = (bounds["max_y"] - mcy) / bounds["height"]
+    rpx, rpy = _dxf_point_to_render_pct((mcx, mcy), bounds, render_mapping)
 
     mf = [af] + [all_fp[i] for i in used]
+    handle_ids = _unique_handle_ids(
+        handle_id
+        for feature in mf
+        for handle_id in feature.get("handleIDs", [])
+    )
     selected = mf if max_highlights is None else mf[:max_highlights]
     hl = [
-        _compact_render_highlight(geometry_to_render_pct(f["geometry"], bounds))
+        _compact_render_highlight(
+            geometry_to_render_pct(f["geometry"], bounds, render_mapping)
+        )
         for f in selected
     ]
 
@@ -2284,6 +2484,7 @@ def _build_match(
         "highlight_count_total": len(mf),
         "highlight_count_returned": len(hl),
         "highlight_truncated": len(hl) < len(mf),
+        "handleIDs": handle_ids,
     }
 
 
@@ -2364,6 +2565,7 @@ async def scan_dxf(template: dict = Body(...)):
         )
 
     bounds = cache_payload["bounds"]
+    render_mapping = cache_payload.get("render_mapping")
     all_fp = cache_payload["fingerprints"]
     tree = cache_payload["tree"]
     type_index = cache_payload["type_index"]
@@ -2441,6 +2643,7 @@ async def scan_dxf(template: dict = Body(...)):
                     all_fp,
                     max_highlights=scan_highlights_limit,
                     match_score=s,
+                    render_mapping=render_mapping,
                 )
             )
         stats["matching_ms"] = int((time.perf_counter() - t_matching) * 1000)
@@ -2582,6 +2785,7 @@ async def scan_dxf(template: dict = Body(...)):
                     all_fp,
                     max_highlights=scan_highlights_limit,
                     match_score=total_score,
+                    render_mapping=render_mapping,
                 )
             )
         else:
@@ -2640,6 +2844,7 @@ async def scan_dxf_fast(template: dict = Body(...)):
         )
 
     bounds = cache_payload["bounds"]
+    render_mapping = cache_payload.get("render_mapping")
     all_fp = cache_payload["fingerprints"]
     coords = cache_payload["coords"]
     sizes = cache_payload["sizes"]
@@ -2719,6 +2924,7 @@ async def scan_dxf_fast(template: dict = Body(...)):
                     all_fp,
                     max_highlights=scan_highlights_limit,
                     match_score=s,
+                    render_mapping=render_mapping,
                 )
             )
         stats["matching_ms"] = int((time.perf_counter() - t_matching) * 1000)
@@ -2921,6 +3127,7 @@ async def scan_dxf_fast(template: dict = Body(...)):
                     all_fp,
                     max_highlights=scan_highlights_limit,
                     match_score=total_score,
+                    render_mapping=render_mapping,
                 )
             )
         else:

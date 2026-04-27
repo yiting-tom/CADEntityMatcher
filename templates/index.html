@@ -459,6 +459,8 @@
                         disabled>Remove Selected</button>
                     <button id="btn-download-matched-dxf" class="btn-sm" onclick="downloadMatchedDXF()"
                         disabled>Download Matched DXF</button>
+                    <button id="btn-download-matches-json" class="btn-sm" onclick="downloadMatchesJson()"
+                        disabled>Download Matches JSON</button>
                 </div>
                 <div class="toolbar-group">
                     <span>Scan</span>
@@ -572,6 +574,7 @@
         const hlG = document.getElementById('hl-group');
         const btnRemoveEntities = document.getElementById('btn-remove-entities');
         const btnDownloadMatchedDxf = document.getElementById('btn-download-matched-dxf');
+        const btnDownloadMatchesJson = document.getElementById('btn-download-matches-json');
         const selectionHint = document.getElementById('selection-hint');
         const settingsContainer = document.getElementById('settings-container');
         const templateLibraryContainer = document.getElementById('template-library-container');
@@ -1178,6 +1181,7 @@
 
         function setMatchButtonsEnabled(enabled) {
             btnDownloadMatchedDxf.disabled = !enabled;
+            btnDownloadMatchesJson.disabled = !enabled;
         }
 
         function makeEntityKey(entity) {
@@ -1249,10 +1253,22 @@
             activeLibraryTemplateId = null;
             activeLibraryCategory = null;
             renderTemplateLibrary(templateLibraryData);
+            var clickHighlights = clickSelections
+                .map(function (item) { return item.highlight; })
+                .filter(function (item) { return !!item; });
+            var clickLabels = clickSelections
+                .filter(function (item) { return !!item.highlight; })
+                .map(function (item) {
+                    return {
+                        handleIDs: item.entity.handleIDs || [],
+                        x: item.entity.x,
+                        y: item.entity.y,
+                        type: item.entity.type,
+                    };
+                });
             renderTemplateHighlights(
-                clickSelections
-                    .map(function (item) { return item.highlight; })
-                    .filter(function (item) { return !!item; })
+                clickHighlights,
+                clickLabels
             );
             setSelectionButtonsEnabled(true);
             setExtractPreviewFromClickSelection(note);
@@ -1410,6 +1426,26 @@
             document.body.removeChild(a);
             URL.revokeObjectURL(url);
         }
+        function buildMatchesJsonPayload() {
+            return (currentMatchResult && currentMatchResult.matches ? currentMatchResult.matches : []).map(function (match, idx) {
+                return {
+                    match_index: idx,
+                    template_name: match.template_name || null,
+                    template_category: match.template_category || null,
+                    dxf_x: match.dxf_x,
+                    dxf_y: match.dxf_y,
+                    render_pct_x: match.render_pct_x,
+                    render_pct_y: match.render_pct_y,
+                    match_score: match.match_score,
+                    handleIDs: match.handleIDs || [],
+                };
+            });
+        }
+        function downloadMatchesJson() {
+            if (!currentMatchResult || !currentMatchResult.matches || !currentMatchResult.matches.length) return;
+            var suffix = currentCacheId ? currentCacheId.slice(0, 8) : 'matches';
+            downloadJson('matched_entities_' + suffix + '.json', buildMatchesJsonPayload());
+        }
         async function downloadMatchedDXF() {
             if (!currentMatchResult || !currentCacheId) return;
             var res = await fetch('/download_matched_dxf', {
@@ -1479,6 +1515,7 @@
                         "Removed filtered entities: " + (data.removed_entity_count ?? 0),
                         "Removed circles by radius grouping: " + (data.removed_circle_count ?? 0),
                         "Entity count: " + (data.entity_count ?? 0),
+                        "Coordinate basis: " + (data.coord_basis || "dxf_extents"),
                         "SVG render time: " + (data.svg_render_time_ms ?? 0) + " ms",
                         "Cache build time: " + (data.cache_build_time_ms ?? 0) + " ms",
                     ];
@@ -1643,7 +1680,7 @@
                 activeLibraryTemplateId = null;
                 activeLibraryCategory = null;
                 renderTemplateLibrary(templateLibraryData);
-                renderTemplateHighlights(result.highlights || []);
+                renderTemplateHighlights(result.highlights || [], result.highlight_labels || []);
                 setSelectionButtonsEnabled(true);
             } else {
                 tmplG.innerHTML = '';
@@ -1721,14 +1758,64 @@
             );
         }
 
-        function renderTemplateHighlights(highlights) {
+        function getHighlightLabelAnchor(highlight) {
+            if (!highlight) return null;
+            if (highlight.kind === "circle") {
+                return svgPctToContent(highlight.cx_pct, highlight.cy_pct);
+            }
+            if (highlight.kind === "polyline") {
+                var pts = highlight.points_pct || [];
+                if (!pts.length) return null;
+                var sx = 0, sy = 0;
+                pts.forEach(function (pt) {
+                    sx += pt[0];
+                    sy += pt[1];
+                });
+                return svgPctToContent(sx / pts.length, sy / pts.length);
+            }
+            return null;
+        }
+
+        function formatTemplateLabel(label) {
+            label = label || {};
+            var handles = label.handleIDs && label.handleIDs.length
+                ? label.handleIDs.join(",")
+                : "none";
+            var x = Number(label.x);
+            var y = Number(label.y);
+            var coord = Number.isFinite(x) && Number.isFinite(y)
+                ? "(" + x.toFixed(3) + ", " + y.toFixed(3) + ")"
+                : "(n/a)";
+            return "H:" + handles + " " + coord;
+        }
+
+        function drawTemplateLabel(anchor, label) {
+            if (!anchor) return;
+            var NS = "http://www.w3.org/2000/svg";
+            var text = document.createElementNS(NS, "text");
+            var fontSize = Math.max(10 / scale, 1.5);
+            text.setAttribute("x", anchor.x + 6 / scale);
+            text.setAttribute("y", anchor.y - 6 / scale);
+            text.setAttribute("fill", "#0b5d2a");
+            text.setAttribute("stroke", "white");
+            text.setAttribute("stroke-width", 3 / scale);
+            text.setAttribute("paint-order", "stroke");
+            text.setAttribute("font-size", fontSize);
+            text.setAttribute("font-family", "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace");
+            text.setAttribute("pointer-events", "none");
+            text.textContent = formatTemplateLabel(label);
+            tmplG.appendChild(text);
+        }
+
+        function renderTemplateHighlights(highlights, labels) {
             var NS = "http://www.w3.org/2000/svg";
             var sw = 2 / scale;
             var drawLimit = getRuntimeSettingValue('template_highlights_draw_limit', MAX_TEMPLATE_HIGHLIGHTS_TO_DRAW);
             var polylinePointLimit = getRuntimeSettingValue('polyline_points_draw_limit', MAX_POLYLINE_POINTS_DRAW);
             tmplG.innerHTML = "";
             var drawList = (highlights || []).slice(0, drawLimit);
-            drawList.forEach(function (h) {
+            var drawLabels = labels || [];
+            drawList.forEach(function (h, idx) {
                 if (h.kind === "circle") {
                     var c = document.createElementNS(NS, "circle");
                     var cc = svgPctToContent(h.cx_pct, h.cy_pct);
@@ -1751,6 +1838,7 @@
                     pl.setAttribute("stroke-width", sw);
                     tmplG.appendChild(pl);
                 }
+                drawTemplateLabel(getHighlightLabelAnchor(h), drawLabels[idx]);
             });
             if (highlights && highlights.length > drawLimit) {
                 document.getElementById('extract-result').innerText +=
