@@ -107,8 +107,10 @@ The `Settings` panel is foldable and exposes runtime controls such as:
 - Enabled plugins
 - Match score thresholds
 - Size and distance tolerances
-- Highlight return limits
-- Preview and draw-count limits
+- Server highlight and preview return limits
+
+Pure client display limits such as draw counts and rendered preview caps use fixed
+defaults and are not shown in the settings panel.
 
 These settings are sent to the backend and affect extract/scan behavior directly.
 

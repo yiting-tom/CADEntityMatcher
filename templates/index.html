@@ -499,14 +499,6 @@
                     <h2>Scan Status</h2>
                     <p id="scan-status" class="status-line"></p>
                     <details open>
-                        <summary>Settings</summary>
-                        <div class="details-body">
-                            <div id="settings-container" class="settings-stack">
-                                <div class="setting-meta">Loading settings...</div>
-                            </div>
-                        </div>
-                    </details>
-                    <details open>
                         <summary>Template Library</summary>
                         <div class="details-body">
                             <div class="library-save-fields">
@@ -560,6 +552,14 @@
                         <summary>Matches</summary>
                         <div class="details-body">
                             <pre id="scan-result">Waiting for scan...</pre>
+                        </div>
+                    </details>
+                    <details open>
+                        <summary>Settings</summary>
+                        <div class="details-body">
+                            <div id="settings-container" class="settings-stack">
+                                <div class="setting-meta">Loading settings...</div>
+                            </div>
                         </div>
                     </details>
                 </section>
@@ -732,16 +732,6 @@
                 if (!Number.isNaN(value)) settings[key] = value;
             });
             return settings;
-        }
-
-        function getRuntimeSettingValue(settingId, fallback) {
-            var el = settingsContainer.querySelector('[data-setting-id="' + settingId + '"]');
-            if (!el) return fallback;
-            var type = el.getAttribute('data-setting-type');
-            var raw = el.value;
-            if (raw === '') return fallback;
-            var value = type === 'int' ? parseInt(raw, 10) : parseFloat(raw);
-            return Number.isNaN(value) ? fallback : value;
         }
 
         function updateSaveTemplateButton() {
@@ -1300,7 +1290,7 @@
                     : getIdleSelectionPrompt();
                 return;
             }
-            var previewLimit = getRuntimeSettingValue('entities_preview_limit', MAX_ENTITIES_PREVIEW);
+            var previewLimit = MAX_ENTITIES_PREVIEW;
             var entities = clickSelections.map(function (item) { return item.entity; });
             var preview = {
                 selector_mode: 'click',
@@ -1450,7 +1440,7 @@
                 document.getElementById('extract-result').innerText = JSON.stringify(result, null, 2);
                 return;
             }
-            var previewLimit = getRuntimeSettingValue('entities_preview_limit', MAX_ENTITIES_PREVIEW);
+            var previewLimit = MAX_ENTITIES_PREVIEW;
             var entities = result.entities_preview || result.entities || [];
             var highlights = result.highlights || [];
             var entityTotal = result.entity_count ?? entities.length;
@@ -1475,7 +1465,7 @@
                 document.getElementById('scan-result').innerText = JSON.stringify(data, null, 2);
                 return;
             }
-            var previewLimit = getRuntimeSettingValue('matches_preview_limit', MAX_MATCHES_PREVIEW);
+            var previewLimit = MAX_MATCHES_PREVIEW;
             var matches = data.matches || [];
             var previewMatches = matches.slice(0, previewLimit).map(function (m) {
                 return {
@@ -1913,8 +1903,8 @@
         function renderTemplateHighlights(highlights, labels) {
             var NS = "http://www.w3.org/2000/svg";
             var sw = 2 / scale;
-            var drawLimit = getRuntimeSettingValue('template_highlights_draw_limit', MAX_TEMPLATE_HIGHLIGHTS_TO_DRAW);
-            var polylinePointLimit = getRuntimeSettingValue('polyline_points_draw_limit', MAX_POLYLINE_POINTS_DRAW);
+            var drawLimit = MAX_TEMPLATE_HIGHLIGHTS_TO_DRAW;
+            var polylinePointLimit = MAX_POLYLINE_POINTS_DRAW;
             tmplG.innerHTML = "";
             var drawList = (highlights || []).slice(0, drawLimit);
             var drawLabels = labels || [];
@@ -1952,7 +1942,7 @@
         function renderRemovedHighlights() {
             var NS = "http://www.w3.org/2000/svg";
             var sw = 4 / scale;
-            var polylinePointLimit = getRuntimeSettingValue('polyline_points_draw_limit', MAX_POLYLINE_POINTS_DRAW);
+            var polylinePointLimit = MAX_POLYLINE_POINTS_DRAW;
             removedG.innerHTML = "";
             removedHighlights.forEach(function (h) {
                 if (h.kind === "circle") {
@@ -2268,10 +2258,10 @@
         function renderHighlights(matches) {
             var NS = "http://www.w3.org/2000/svg";
             var sw = 2 / scale;
-            var matchesDrawLimit = getRuntimeSettingValue('matches_draw_limit', MAX_MATCHES_TO_DRAW);
-            var highlightsPerMatchLimit = getRuntimeSettingValue('highlights_per_match_draw_limit', MAX_HIGHLIGHTS_PER_MATCH_TO_DRAW);
-            var totalHighlightsLimit = getRuntimeSettingValue('total_highlights_draw_limit', MAX_TOTAL_HIGHLIGHTS_TO_DRAW);
-            var polylinePointLimit = getRuntimeSettingValue('polyline_points_draw_limit', MAX_POLYLINE_POINTS_DRAW);
+            var matchesDrawLimit = MAX_MATCHES_TO_DRAW;
+            var highlightsPerMatchLimit = MAX_HIGHLIGHTS_PER_MATCH_TO_DRAW;
+            var totalHighlightsLimit = MAX_TOTAL_HIGHLIGHTS_TO_DRAW;
+            var polylinePointLimit = MAX_POLYLINE_POINTS_DRAW;
             hlG.innerHTML = "";
             var drawMatches = (matches || []).slice(0, matchesDrawLimit);
             var drawnHighlights = 0;
