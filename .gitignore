@@ -5,3 +5,5 @@ __pycache__/
 .claude/
 .vscode
 !test.dxf
+.DS_Store
+data/template_library.sqlite*

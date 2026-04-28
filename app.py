@@ -2,6 +2,7 @@ from collections import Counter
 import json
 import math
 import os
+import sqlite3
 import tempfile
 import threading
 import time
@@ -29,6 +30,7 @@ app = FastAPI()
 BASE_DIR = Path(__file__).resolve().parent
 INDEX_HTML_PATH = BASE_DIR / "templates" / "index.html"
 TEMPLATE_LIBRARY_PATH = BASE_DIR / "data" / "template_library.json"
+TEMPLATE_LIBRARY_DB_PATH = BASE_DIR / "data" / "template_library.sqlite"
 NO_STORE_HEADERS = {
     "Cache-Control": "no-store, max-age=0",
     "Pragma": "no-cache",
@@ -1437,6 +1439,27 @@ def _delete_template_library_template(template_id):
     return library
 
 
+def _delete_template_library_category(category_name):
+    normalized_category = _normalize_template_category(category_name)
+    with _template_library_lock:
+        library = _read_template_library_locked()
+        active_version = _get_active_template_library_version(library)
+        current_templates = active_version.get("templates", [])
+        kept = [
+            template
+            for template in current_templates
+            if _normalize_template_category(template.get("category"))
+            != normalized_category
+        ]
+        deleted_count = len(current_templates) - len(kept)
+        if deleted_count == 0:
+            return None, 0
+        active_version["templates"] = kept
+        active_version["updated_at"] = time.time()
+        _write_template_library_locked(library)
+    return library, deleted_count
+
+
 def _delete_template_library_version(version_id):
     with _template_library_lock:
         library = _read_template_library_locked()
@@ -1511,6 +1534,543 @@ def _build_exportable_template_library_version(version):
         "created_at": version.get("created_at", 0.0),
         "updated_at": version.get("updated_at", 0.0),
         "templates": version.get("templates", []),
+    }
+
+
+def _sqlite_library_connect():
+    TEMPLATE_LIBRARY_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(TEMPLATE_LIBRARY_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def _sqlite_library_init_locked(conn):
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS libraries (
+            id TEXT PRIMARY KEY,
+            label TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS templates (
+            id TEXT PRIMARY KEY,
+            library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            category TEXT NOT NULL,
+            group_center_json TEXT NOT NULL,
+            entities_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
+    )
+    conn.commit()
+    _sqlite_migrate_legacy_json_locked(conn)
+    _sqlite_cleanup_duplicate_empty_libraries_locked(conn)
+    _sqlite_ensure_default_library_locked(conn)
+
+
+def _sqlite_insert_library_locked(conn, library):
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO libraries(id, label, created_at, updated_at)
+        VALUES(?, ?, ?, ?)
+        """,
+        (
+            library["id"],
+            library["label"],
+            float(library.get("created_at") or time.time()),
+            float(
+                library.get("updated_at") or library.get("created_at") or time.time()
+            ),
+        ),
+    )
+    for template in library.get("templates", []):
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO templates(
+                id, library_id, name, category, group_center_json, entities_json,
+                created_at, updated_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                template["id"],
+                library["id"],
+                template["name"],
+                template["category"],
+                json.dumps(template["group_center"], ensure_ascii=False),
+                json.dumps(template.get("entities", []), ensure_ascii=False),
+                float(template.get("created_at") or time.time()),
+                float(
+                    template.get("updated_at")
+                    or template.get("created_at")
+                    or time.time()
+                ),
+            ),
+        )
+
+
+def _sqlite_migrate_legacy_json_locked(conn):
+    migrated = conn.execute(
+        "SELECT value FROM app_meta WHERE key = 'legacy_json_migrated'"
+    ).fetchone()
+    if migrated is not None:
+        return
+    has_libraries = conn.execute("SELECT COUNT(*) AS count FROM libraries").fetchone()
+    if has_libraries and int(has_libraries["count"]) > 0:
+        conn.execute(
+            "INSERT OR REPLACE INTO app_meta(key, value) VALUES(?, ?)",
+            ("legacy_json_migrated", "1"),
+        )
+        conn.commit()
+        return
+    if TEMPLATE_LIBRARY_PATH.exists():
+        try:
+            raw = json.loads(TEMPLATE_LIBRARY_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw = {"versions": []}
+        payload = _normalize_template_library_payload(raw)
+        for version in payload["versions"]:
+            library = dict(version)
+            _sqlite_insert_library_locked(conn, library)
+        if payload.get("active_version_id"):
+            conn.execute(
+                "INSERT OR REPLACE INTO app_meta(key, value) VALUES(?, ?)",
+                ("active_library_id", payload["active_version_id"]),
+            )
+    conn.execute(
+        "INSERT OR REPLACE INTO app_meta(key, value) VALUES(?, ?)",
+        ("legacy_json_migrated", "1"),
+    )
+    conn.commit()
+
+
+def _sqlite_cleanup_duplicate_empty_libraries_locked(conn):
+    active_id = _sqlite_active_library_id_locked(conn, allow_missing=True)
+    rows = conn.execute(
+        """
+        SELECT
+            libraries.id,
+            libraries.label,
+            libraries.created_at,
+            libraries.updated_at,
+            COUNT(templates.id) AS template_count
+        FROM libraries
+        LEFT JOIN templates ON templates.library_id = libraries.id
+        GROUP BY libraries.id
+        ORDER BY libraries.created_at ASC, libraries.id ASC
+        """
+    ).fetchall()
+    seen = {}
+    delete_ids = []
+    for row in rows:
+        if int(row["template_count"]) != 0:
+            continue
+        key = (row["label"], float(row["created_at"]), float(row["updated_at"]))
+        existing_id = seen.get(key)
+        if existing_id is None:
+            seen[key] = row["id"]
+            continue
+        if row["id"] == active_id:
+            delete_ids.append(existing_id)
+            seen[key] = row["id"]
+        else:
+            delete_ids.append(row["id"])
+    if not delete_ids:
+        return
+    conn.executemany("DELETE FROM libraries WHERE id = ?", [(id_,) for id_ in delete_ids])
+    if active_id in delete_ids:
+        fallback = conn.execute(
+            "SELECT id FROM libraries ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        if fallback is not None:
+            conn.execute(
+                "INSERT OR REPLACE INTO app_meta(key, value) VALUES(?, ?)",
+                ("active_library_id", fallback["id"]),
+            )
+    conn.commit()
+
+
+def _sqlite_ensure_default_library_locked(conn):
+    row = conn.execute("SELECT id FROM libraries LIMIT 1").fetchone()
+    if row is None:
+        now = time.time()
+        library = {
+            "id": uuid.uuid4().hex,
+            "label": "Default Library",
+            "created_at": now,
+            "updated_at": now,
+            "templates": [],
+        }
+        _sqlite_insert_library_locked(conn, library)
+        conn.execute(
+            "INSERT OR REPLACE INTO app_meta(key, value) VALUES(?, ?)",
+            ("active_library_id", library["id"]),
+        )
+        conn.commit()
+        return library["id"]
+    active_id = _sqlite_active_library_id_locked(conn, allow_missing=True)
+    if active_id is None:
+        conn.execute(
+            "INSERT OR REPLACE INTO app_meta(key, value) VALUES(?, ?)",
+            ("active_library_id", row["id"]),
+        )
+        conn.commit()
+        return row["id"]
+    return active_id
+
+
+def _sqlite_active_library_id_locked(conn, *, allow_missing=False):
+    row = conn.execute(
+        "SELECT value FROM app_meta WHERE key = 'active_library_id'"
+    ).fetchone()
+    active_id = row["value"] if row else None
+    if active_id:
+        exists = conn.execute(
+            "SELECT id FROM libraries WHERE id = ?", (active_id,)
+        ).fetchone()
+        if exists is not None:
+            return active_id
+    if allow_missing:
+        return None
+    fallback = conn.execute(
+        "SELECT id FROM libraries ORDER BY created_at ASC LIMIT 1"
+    ).fetchone()
+    if fallback is None:
+        return _sqlite_ensure_default_library_locked(conn)
+    conn.execute(
+        "INSERT OR REPLACE INTO app_meta(key, value) VALUES(?, ?)",
+        ("active_library_id", fallback["id"]),
+    )
+    conn.commit()
+    return fallback["id"]
+
+
+def _sqlite_set_active_library_locked(conn, library_id):
+    exists = conn.execute(
+        "SELECT id FROM libraries WHERE id = ?", (library_id,)
+    ).fetchone()
+    if exists is None:
+        return False
+    conn.execute(
+        "INSERT OR REPLACE INTO app_meta(key, value) VALUES(?, ?)",
+        ("active_library_id", library_id),
+    )
+    conn.commit()
+    return True
+
+
+def _sqlite_template_from_row(row):
+    try:
+        group_center = json.loads(row["group_center_json"])
+    except (TypeError, json.JSONDecodeError):
+        group_center = None
+    try:
+        entities = json.loads(row["entities_json"])
+    except (TypeError, json.JSONDecodeError):
+        entities = []
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "category": row["category"],
+        "group_center": group_center,
+        "entities": entities,
+        "created_at": float(row["created_at"]),
+        "updated_at": float(row["updated_at"]),
+    }
+
+
+def _sqlite_templates_for_library_locked(conn, library_id):
+    rows = conn.execute(
+        """
+        SELECT * FROM templates
+        WHERE library_id = ?
+        ORDER BY lower(category), lower(name), created_at
+        """,
+        (library_id,),
+    ).fetchall()
+    return [_sqlite_template_from_row(row) for row in rows]
+
+
+def _sqlite_library_response():
+    with _template_library_lock:
+        with _sqlite_library_connect() as conn:
+            _sqlite_library_init_locked(conn)
+            active_id = _sqlite_active_library_id_locked(conn)
+            active = conn.execute(
+                "SELECT * FROM libraries WHERE id = ?", (active_id,)
+            ).fetchone()
+            library_rows = conn.execute(
+                """
+                SELECT libraries.*, COUNT(templates.id) AS template_count
+                FROM libraries
+                LEFT JOIN templates ON templates.library_id = libraries.id
+                GROUP BY libraries.id
+                ORDER BY libraries.created_at DESC
+                """
+            ).fetchall()
+            templates = _sqlite_templates_for_library_locked(conn, active_id)
+
+    libraries = [
+        {
+            "id": row["id"],
+            "label": row["label"],
+            "template_count": int(row["template_count"]),
+            "created_at": float(row["created_at"]),
+            "updated_at": float(row["updated_at"]),
+            "is_active": row["id"] == active_id,
+        }
+        for row in library_rows
+    ]
+    return {
+        "active_library_id": active["id"],
+        "active_library_label": active["label"],
+        "library_count": len(libraries),
+        "libraries": libraries,
+        "template_count": len(templates),
+        "categories": _build_template_library_categories(templates),
+        "active_version_id": active["id"],
+        "active_version_label": active["label"],
+        "version_count": len(libraries),
+        "versions": libraries,
+    }
+
+
+def _sqlite_create_library(label):
+    now = time.time()
+    library = {
+        "id": uuid.uuid4().hex,
+        "label": str(label or "").strip()
+        or "Library " + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
+        "created_at": now,
+        "updated_at": now,
+        "templates": [],
+    }
+    with _template_library_lock:
+        with _sqlite_library_connect() as conn:
+            _sqlite_library_init_locked(conn)
+            _sqlite_insert_library_locked(conn, library)
+            _sqlite_set_active_library_locked(conn, library["id"])
+            conn.commit()
+    return library
+
+
+def _sqlite_rename_library(library_id, label):
+    label = str(label or "").strip()
+    if not library_id or not label:
+        return False
+    with _template_library_lock:
+        with _sqlite_library_connect() as conn:
+            _sqlite_library_init_locked(conn)
+            cur = conn.execute(
+                "UPDATE libraries SET label = ?, updated_at = ? WHERE id = ?",
+                (label, time.time(), library_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+
+def _sqlite_select_library(library_id):
+    with _template_library_lock:
+        with _sqlite_library_connect() as conn:
+            _sqlite_library_init_locked(conn)
+            return _sqlite_set_active_library_locked(conn, library_id)
+
+
+def _sqlite_delete_library(library_id):
+    with _template_library_lock:
+        with _sqlite_library_connect() as conn:
+            _sqlite_library_init_locked(conn)
+            exists = conn.execute(
+                "SELECT id FROM libraries WHERE id = ?", (library_id,)
+            ).fetchone()
+            if exists is None:
+                return False
+            conn.execute("DELETE FROM libraries WHERE id = ?", (library_id,))
+            fallback = conn.execute(
+                "SELECT id FROM libraries ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+            if fallback is None:
+                now = time.time()
+                library = {
+                    "id": uuid.uuid4().hex,
+                    "label": "Default Library",
+                    "created_at": now,
+                    "updated_at": now,
+                    "templates": [],
+                }
+                _sqlite_insert_library_locked(conn, library)
+                fallback_id = library["id"]
+            else:
+                fallback_id = fallback["id"]
+            _sqlite_set_active_library_locked(conn, fallback_id)
+            conn.commit()
+            return True
+
+
+def _sqlite_save_template_library_entry(name, category, group_center, entities):
+    cleaned_entities = _sanitize_template_entities(entities)
+    if not cleaned_entities:
+        return None
+    cleaned_group_center = _sanitize_template_group_center(group_center)
+    if cleaned_group_center is None:
+        cleaned_group_center = _compute_group_center_from_entities(cleaned_entities)
+    now = time.time()
+    record = {
+        "id": uuid.uuid4().hex,
+        "name": str(name or "").strip() or _default_template_name(),
+        "category": _normalize_template_category(category),
+        "group_center": cleaned_group_center,
+        "entities": cleaned_entities,
+        "created_at": now,
+        "updated_at": now,
+    }
+    with _template_library_lock:
+        with _sqlite_library_connect() as conn:
+            _sqlite_library_init_locked(conn)
+            library_id = _sqlite_active_library_id_locked(conn)
+            conn.execute(
+                """
+                INSERT INTO templates(
+                    id, library_id, name, category, group_center_json, entities_json,
+                    created_at, updated_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record["id"],
+                    library_id,
+                    record["name"],
+                    record["category"],
+                    json.dumps(record["group_center"], ensure_ascii=False),
+                    json.dumps(record["entities"], ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+            conn.execute(
+                "UPDATE libraries SET updated_at = ? WHERE id = ?",
+                (now, library_id),
+            )
+            conn.commit()
+    return record
+
+
+def _sqlite_resolve_template_entries(template_ids):
+    if not isinstance(template_ids, list):
+        return []
+    wanted = [str(tid) for tid in template_ids if str(tid).strip()]
+    if not wanted:
+        return []
+    placeholders = ",".join("?" for _ in wanted)
+    with _template_library_lock:
+        with _sqlite_library_connect() as conn:
+            _sqlite_library_init_locked(conn)
+            library_id = _sqlite_active_library_id_locked(conn)
+            rows = conn.execute(
+                f"""
+                SELECT * FROM templates
+                WHERE library_id = ? AND id IN ({placeholders})
+                """,
+                [library_id, *wanted],
+            ).fetchall()
+    records = {
+        _sqlite_template_from_row(row)["id"]: _sqlite_template_from_row(row)
+        for row in rows
+    }
+    return [records[tid] for tid in wanted if tid in records]
+
+
+def _sqlite_delete_template(template_id):
+    with _template_library_lock:
+        with _sqlite_library_connect() as conn:
+            _sqlite_library_init_locked(conn)
+            library_id = _sqlite_active_library_id_locked(conn)
+            cur = conn.execute(
+                "DELETE FROM templates WHERE library_id = ? AND id = ?",
+                (library_id, template_id),
+            )
+            if cur.rowcount == 0:
+                return False
+            conn.execute(
+                "UPDATE libraries SET updated_at = ? WHERE id = ?",
+                (time.time(), library_id),
+            )
+            conn.commit()
+            return True
+
+
+def _sqlite_delete_category(category_name):
+    category = _normalize_template_category(category_name)
+    with _template_library_lock:
+        with _sqlite_library_connect() as conn:
+            _sqlite_library_init_locked(conn)
+            library_id = _sqlite_active_library_id_locked(conn)
+            cur = conn.execute(
+                "DELETE FROM templates WHERE library_id = ? AND category = ?",
+                (library_id, category),
+            )
+            if cur.rowcount == 0:
+                return 0
+            conn.execute(
+                "UPDATE libraries SET updated_at = ? WHERE id = ?",
+                (time.time(), library_id),
+            )
+            conn.commit()
+            return cur.rowcount
+
+
+def _sqlite_import_libraries(raw):
+    payload = _normalize_template_library_payload(raw)
+    imported = []
+    with _template_library_lock:
+        with _sqlite_library_connect() as conn:
+            _sqlite_library_init_locked(conn)
+            for source in payload["versions"]:
+                library = dict(source)
+                library["id"] = uuid.uuid4().hex
+                library["templates"] = [
+                    dict(template, id=uuid.uuid4().hex)
+                    for template in source.get("templates", [])
+                ]
+                _sqlite_insert_library_locked(conn, library)
+                imported.append(library)
+            if imported:
+                _sqlite_set_active_library_locked(conn, imported[-1]["id"])
+            conn.commit()
+    return imported
+
+
+def _sqlite_export_active_library():
+    with _template_library_lock:
+        with _sqlite_library_connect() as conn:
+            _sqlite_library_init_locked(conn)
+            library_id = _sqlite_active_library_id_locked(conn)
+            library = conn.execute(
+                "SELECT * FROM libraries WHERE id = ?", (library_id,)
+            ).fetchone()
+            templates = _sqlite_templates_for_library_locked(conn, library_id)
+    return {
+        "library_id": library["id"],
+        "library_label": library["label"],
+        "created_at": float(library["created_at"]),
+        "updated_at": float(library["updated_at"]),
+        "templates": templates,
     }
 
 
@@ -1923,6 +2483,14 @@ register_single_entity_plugin(
     default_enabled=True,
 )
 
+
+@app.on_event("startup")
+async def startup_template_library_db():
+    with _template_library_lock:
+        with _sqlite_library_connect() as conn:
+            _sqlite_library_init_locked(conn)
+
+
 # --- FastAPI routes ---
 
 
@@ -1953,96 +2521,102 @@ async def get_settings_schema():
 
 @app.get("/template_library")
 async def get_template_library():
-    return _template_library_json_response(_build_template_library_response())
+    return _template_library_json_response(_sqlite_library_response())
 
 
-@app.get("/template_library/download")
-async def download_template_library():
-    with _template_library_lock:
-        library = _read_template_library_locked()
-        active_version = _get_active_template_library_version(library)
-        export_payload = _build_exportable_template_library_version(active_version)
-    export_text = json.dumps(export_payload, ensure_ascii=False, indent=2)
-    timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-    safe_label = (
-        "".join(
-            ch.lower() if ch.isalnum() else "_" for ch in active_version["label"]
-        ).strip("_")
-        or "template_library"
-    )
-    tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
-    tmp_path = tmp.name
-    tmp.write(export_text.encode("utf-8"))
-    tmp.close()
-    return FileResponse(
-        tmp_path,
-        media_type="application/json",
-        filename=f"{safe_label}_{timestamp}.json",
-        background=BackgroundTask(
-            lambda: os.path.exists(tmp_path) and os.remove(tmp_path)
-        ),
+@app.post("/template_library/create_library")
+async def create_template_library(data: dict = Body(...)):
+    label = str(data.get("label") or "").strip()
+    if not label:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Missing library label."},
+        )
+    created = _sqlite_create_library(label)
+    return _template_library_json_response(
+        {"created_library": created, "library": _sqlite_library_response()}
     )
 
 
-@app.post("/template_library/upload")
-async def upload_template_library(file: UploadFile = File(...)):
-    raw = await file.read()
-    if not raw:
+@app.post("/template_library/rename_library")
+async def rename_template_library(data: dict = Body(...)):
+    library_id = str(data.get("library_id") or data.get("version_id") or "").strip()
+    label = str(data.get("label") or "").strip()
+    if not library_id or not label:
         return JSONResponse(
             status_code=400,
-            content={"error": "Empty upload."},
+            content={"error": "Missing library_id or label."},
         )
-    try:
-        payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    if not _sqlite_rename_library(library_id, label):
         return JSONResponse(
-            status_code=400,
-            content={"error": "Invalid JSON file."},
+            status_code=404,
+            content={"error": "Template library not found."},
         )
+    return _template_library_json_response(_sqlite_library_response())
 
-    library, imported_versions = _import_template_library_versions(payload)
-    return {
-        "status": "success",
-        "imported_version_count": len(imported_versions),
-        "template_count": sum(
-            len(version.get("templates", [])) for version in imported_versions
-        ),
-        "library": _build_template_library_response(),
-    }
+
+@app.post("/template_library/select_library")
+async def select_template_library(data: dict = Body(...)):
+    library_id = str(data.get("library_id") or data.get("version_id") or "").strip()
+    if not library_id:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Missing library_id."},
+        )
+    if not _sqlite_select_library(library_id):
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Template library not found."},
+        )
+    return _template_library_json_response(_sqlite_library_response())
 
 
 @app.post("/template_library/select_version")
 async def select_template_library_version(data: dict = Body(...)):
-    version_id = str(data.get("version_id") or "").strip()
+    version_id = str(data.get("version_id") or data.get("library_id") or "").strip()
     if not version_id:
         return JSONResponse(
             status_code=400,
-            content={"error": "Missing version_id."},
+            content={"error": "Missing library_id."},
         )
-    library = _select_template_library_version(version_id)
-    if library is None:
+    if not _sqlite_select_library(version_id):
         return JSONResponse(
             status_code=404,
-            content={"error": "Template library version not found."},
+            content={"error": "Template library not found."},
         )
-    return _template_library_json_response(_build_template_library_response())
+    return _template_library_json_response(_sqlite_library_response())
+
+
+@app.post("/template_library/delete_library")
+async def delete_template_library(data: dict = Body(...)):
+    library_id = str(data.get("library_id") or data.get("version_id") or "").strip()
+    if not library_id:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Missing library_id."},
+        )
+    if not _sqlite_delete_library(library_id):
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Template library not found."},
+        )
+    return _template_library_json_response(_sqlite_library_response())
 
 
 @app.post("/template_library/delete_version")
 async def delete_template_library_version(data: dict = Body(...)):
-    version_id = str(data.get("version_id") or "").strip()
+    version_id = str(data.get("version_id") or data.get("library_id") or "").strip()
     if not version_id:
         return JSONResponse(
             status_code=400,
-            content={"error": "Missing version_id."},
+            content={"error": "Missing library_id."},
         )
-    library = _delete_template_library_version(version_id)
-    if library is None:
+    if not _sqlite_delete_library(version_id):
         return JSONResponse(
             status_code=404,
-            content={"error": "Template library version not found."},
+            content={"error": "Template library not found."},
         )
-    return _template_library_json_response(_build_template_library_response())
+    return _template_library_json_response(_sqlite_library_response())
 
 
 @app.post("/template_library/save")
@@ -2062,7 +2636,7 @@ async def save_template_library(data: dict = Body(...)):
         group_center = data.get("group_center")
         entities = data.get("entities", [])
 
-    saved = _save_template_library_entry(
+    saved = _sqlite_save_template_library_entry(
         data.get("name"),
         data.get("category"),
         group_center,
@@ -2077,7 +2651,7 @@ async def save_template_library(data: dict = Body(...)):
     return _template_library_json_response(
         {
             "saved_template": _serialize_saved_template(saved),
-            "library": _build_template_library_response(),
+            "library": _sqlite_library_response(),
         }
     )
 
@@ -2090,18 +2664,40 @@ async def delete_template_library_template(data: dict = Body(...)):
             status_code=400,
             content={"error": "Missing template_id."},
         )
-    library = _delete_template_library_template(template_id)
-    if library is None:
+    if not _sqlite_delete_template(template_id):
         return JSONResponse(
             status_code=404,
-            content={"error": "Template not found in active version."},
+            content={"error": "Template not found in active library."},
         )
-    return _template_library_json_response(_build_template_library_response())
+    return _template_library_json_response(_sqlite_library_response())
+
+
+@app.post("/template_library/delete_category")
+async def delete_template_library_category(data: dict = Body(...)):
+    category = str(data.get("category") or "").strip()
+    if not category:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Missing category."},
+        )
+    deleted_count = _sqlite_delete_category(category)
+    if deleted_count == 0:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Category not found in active library."},
+        )
+    return _template_library_json_response(
+        {
+            "deleted_category": _normalize_template_category(category),
+            "deleted_count": deleted_count,
+            "library": _sqlite_library_response(),
+        }
+    )
 
 
 @app.post("/template_library/resolve")
 async def resolve_template_library(data: dict = Body(...)):
-    records = _resolve_template_library_entries(data.get("template_ids", []))
+    records = _sqlite_resolve_template_entries(data.get("template_ids", []))
     return {
         "templates": [
             _serialize_saved_template(record, include_entities=True)
@@ -2581,9 +3177,7 @@ def _apply_roi_filter(cache_payload, roi_pct):
         filtered_fp = []
     else:
         filtered_fp = [
-            f
-            for f in cache_payload["fingerprints"]
-            if _feature_within_roi(f, roi_box)
+            f for f in cache_payload["fingerprints"] if _feature_within_roi(f, roi_box)
         ]
     if filtered_fp:
         coords = np.array([[f["x"], f["y"]] for f in filtered_fp])
@@ -2619,10 +3213,7 @@ def _highlight_within_roi_pct(highlight, roi_pct):
         except (TypeError, ValueError, KeyError):
             return False
         return (
-            min_x <= cx - r
-            and cx + r <= max_x
-            and min_y <= cy - r
-            and cy + r <= max_y
+            min_x <= cx - r and cx + r <= max_x and min_y <= cy - r and cy + r <= max_y
         )
     if kind == "polyline":
         points = highlight.get("points_pct", [])
@@ -2641,7 +3232,7 @@ def _highlight_within_roi_pct(highlight, roi_pct):
 def _match_within_roi_pct(match, roi_pct):
     highlights = match.get("highlights") or []
     if not highlights:
-        return False
+        return FalsGe
     return all(_highlight_within_roi_pct(h, roi_pct) for h in highlights)
 
 
@@ -3307,4 +3898,4 @@ async def scan_dxf_fast(template: dict = Body(...)):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8008)

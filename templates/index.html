@@ -512,11 +512,18 @@
                             <div class="library-save-fields">
                                 <select id="template-library-version" class="setting-input"
                                     onchange="changeTemplateLibraryVersion()">
-                                    <option value="">Loading versions...</option>
+                                    <option value="">Loading libraries...</option>
                                 </select>
-                                <button class="btn-sm btn-danger" type="button"
-                                    onclick="deleteActiveTemplateLibraryVersion()">
-                                    Delete Version
+                                <input id="template-library-name" class="setting-input" type="text"
+                                    placeholder="Library name">
+                                <button class="btn-sm" type="button" onclick="createTemplateLibrary()">
+                                    Create Library
+                                </button>
+                                <button class="btn-sm" type="button" onclick="renameActiveTemplateLibrary()">
+                                    Rename Library
+                                </button>
+                                <button id="btn-delete-library" class="btn-sm btn-danger" type="button">
+                                    Delete Library
                                 </button>
                                 <input id="saved-template-name" class="setting-input" type="text"
                                     placeholder="Template name">
@@ -529,15 +536,6 @@
                                     onclick="deleteLoadedSavedTemplate()" disabled>
                                     Delete Loaded Template
                                 </button>
-                            </div>
-                            <div class="library-transfer-row">
-                                <input id="template-library-file" type="file" accept=".json,application/json">
-                                <div style="display:flex; gap:8px; flex-wrap:wrap;">
-                                    <button class="btn-sm" onclick="uploadTemplateLibrary()">Upload Library
-                                        JSON</button>
-                                    <button class="btn-sm" onclick="downloadTemplateLibrary()">Download Library
-                                        JSON</button>
-                                </div>
                             </div>
                             <p id="template-library-status" class="setting-meta library-status">Loading template
                                 library...</p>
@@ -594,9 +592,10 @@
         const templateLibraryContainer = document.getElementById('template-library-container');
         const templateLibraryStatus = document.getElementById('template-library-status');
         const templateLibraryVersionSelect = document.getElementById('template-library-version');
+        const templateLibraryNameInput = document.getElementById('template-library-name');
+        const btnDeleteLibrary = document.getElementById('btn-delete-library');
         const savedTemplateNameInput = document.getElementById('saved-template-name');
         const savedTemplateCategoryInput = document.getElementById('saved-template-category');
-        const templateLibraryFileInput = document.getElementById('template-library-file');
         const btnSaveTemplate = document.getElementById('btn-save-template');
         const btnDeleteLoadedTemplate = document.getElementById('btn-delete-loaded-template');
 
@@ -757,29 +756,34 @@
         }
 
         function renderTemplateLibraryVersions(data) {
-            activeLibraryVersionId = data && data.active_version_id ? data.active_version_id : null;
+            activeLibraryVersionId = data && (data.active_library_id || data.active_version_id) ? (data.active_library_id || data.active_version_id) : null;
             templateLibraryVersionSelect.innerHTML = '';
-            var versions = (data && data.versions) || [];
-            if (!versions.length) {
-                templateLibraryVersionSelect.innerHTML = '<option value="">No versions</option>';
+            var libraries = (data && (data.libraries || data.versions)) || [];
+            if (!libraries.length) {
+                templateLibraryVersionSelect.innerHTML = '<option value="">No libraries</option>';
                 return;
             }
-            versions.forEach(function (version) {
+            libraries.forEach(function (library) {
                 var option = document.createElement('option');
-                option.value = version.id;
-                option.innerText = version.label + ' (' + (version.template_count || 0) + ')';
-                option.selected = version.id === activeLibraryVersionId;
+                option.value = library.id;
+                option.innerText = library.label + ' (' + (library.template_count || 0) + ')';
+                option.selected = library.id === activeLibraryVersionId;
                 templateLibraryVersionSelect.appendChild(option);
             });
+            var activeOption = templateLibraryVersionSelect.options[templateLibraryVersionSelect.selectedIndex];
+            templateLibraryNameInput.value = activeOption ? activeOption.text.replace(/\s+\(\d+\)$/, '') : '';
         }
 
         function renderTemplateLibrary(data) {
             templateLibraryData = data || { categories: [], template_count: 0 };
             renderTemplateLibraryVersions(templateLibraryData);
+            if (btnDeleteLibrary) {
+                btnDeleteLibrary.disabled = !activeLibraryVersionId;
+            }
             templateLibraryContainer.innerHTML = '';
 
             if (!(templateLibraryData.categories || []).length) {
-                templateLibraryContainer.innerHTML = '<div class="setting-meta">No saved templates in this version.</div>';
+                templateLibraryContainer.innerHTML = '<div class="setting-meta">No saved templates in this library.</div>';
                 return;
             }
 
@@ -806,8 +810,21 @@
                 useCategoryBtn.innerText = 'Use Category';
                 useCategoryBtn.onclick = function () { useSavedTemplateCategory(category.name); };
 
+                var deleteCategoryBtn = document.createElement('button');
+                deleteCategoryBtn.className = 'btn-sm btn-danger';
+                deleteCategoryBtn.type = 'button';
+                deleteCategoryBtn.innerText = 'Delete Category';
+                deleteCategoryBtn.onclick = function () { deleteSavedCategory(category.name, category.template_count || 0); };
+
+                var categoryActions = document.createElement('div');
+                categoryActions.style.display = 'flex';
+                categoryActions.style.gap = '8px';
+                categoryActions.style.flexWrap = 'wrap';
+                categoryActions.appendChild(useCategoryBtn);
+                categoryActions.appendChild(deleteCategoryBtn);
+
                 header.appendChild(headerInfo);
-                header.appendChild(useCategoryBtn);
+                header.appendChild(categoryActions);
                 categoryItem.appendChild(header);
 
                 var templateList = document.createElement('div');
@@ -865,8 +882,8 @@
                 templateLibraryStatus.innerText = statusText
                     ? statusText
                     : ((data.template_count || 0) > 0
-                        ? 'Active version: ' + (data.active_version_label || 'Unknown') + ' | Saved templates: ' + data.template_count
-                        : 'Active version: ' + (data.active_version_label || 'Unknown') + ' | No saved templates yet.');
+                        ? 'Active library: ' + (data.active_library_label || data.active_version_label || 'Unknown') + ' | Saved templates: ' + data.template_count
+                        : 'Active library: ' + (data.active_library_label || data.active_version_label || 'Unknown') + ' | No saved templates yet.');
             } catch (_) {
                 templateLibraryContainer.innerHTML = '<div class="setting-meta">Failed to load template library.</div>';
                 templateLibraryStatus.innerText = 'Failed to load template library.';
@@ -874,17 +891,17 @@
         }
 
         async function changeTemplateLibraryVersion() {
-            var versionId = templateLibraryVersionSelect.value;
-            if (!versionId) return;
-            templateLibraryStatus.innerText = 'Switching library version...';
-            var res = await fetch('/template_library/select_version', {
+            var libraryId = templateLibraryVersionSelect.value;
+            if (!libraryId) return;
+            templateLibraryStatus.innerText = 'Switching library...';
+            var res = await fetch('/template_library/select_library', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ version_id: versionId })
+                body: JSON.stringify({ library_id: libraryId })
             });
             var data = await res.json();
             if (!res.ok || data.error) {
-                templateLibraryStatus.innerText = (data && data.error) || 'Failed to switch version.';
+                templateLibraryStatus.innerText = (data && data.error) || 'Failed to switch library.';
                 return;
             }
             if (currentTemplateBundle || (currentTemplate && currentTemplate.saved_template_id)) {
@@ -892,12 +909,12 @@
                 currentTemplate = null;
                 currentTemplateBundle = null;
                 setSelectionButtonsEnabled(false);
-                document.getElementById('extract-result').innerText = 'Library version switched. Re-select a saved template or category.';
+                document.getElementById('extract-result').innerText = 'Library switched. Re-select a saved template or category.';
             }
             activeLibraryTemplateId = null;
             activeLibraryCategory = null;
             renderTemplateLibrary(data);
-            templateLibraryStatus.innerText = 'Active version: ' + (data.active_version_label || 'Unknown');
+            templateLibraryStatus.innerText = 'Active library: ' + (data.active_library_label || data.active_version_label || 'Unknown');
         }
 
         function resetSavedLibrarySelection(message) {
@@ -912,78 +929,95 @@
             activeLibraryCategory = null;
         }
 
-        async function deleteActiveTemplateLibraryVersion() {
-            var versionId = templateLibraryVersionSelect.value;
-            var versionLabel = templateLibraryVersionSelect.options[templateLibraryVersionSelect.selectedIndex]
-                ? templateLibraryVersionSelect.options[templateLibraryVersionSelect.selectedIndex].text
-                : 'this version';
-            if (!versionId) {
-                templateLibraryStatus.innerText = 'No version selected.';
+        async function createTemplateLibrary() {
+            var label = templateLibraryNameInput.value.trim();
+            if (!label) {
+                templateLibraryStatus.innerText = 'Enter a library name first.';
                 return;
             }
-            if (!window.confirm('Delete template library version "' + versionLabel + '"?')) {
-                return;
-            }
-            templateLibraryStatus.innerText = 'Deleting version...';
-            var res = await fetch('/template_library/delete_version', {
+            templateLibraryStatus.innerText = 'Creating library...';
+            var res = await fetch('/template_library/create_library', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ version_id: versionId })
+                body: JSON.stringify({ label: label })
             });
             var data = await res.json();
             if (!res.ok || data.error) {
-                templateLibraryStatus.innerText = (data && data.error) || 'Failed to delete version.';
+                templateLibraryStatus.innerText = (data && data.error) || 'Failed to create library.';
                 return;
             }
-            resetSavedLibrarySelection('Library version deleted. Re-select a saved template or category.');
-            renderTemplateLibrary(data);
-            templateLibraryStatus.innerText = 'Deleted version. Active version: ' + (data.active_version_label || 'Unknown');
+            resetSavedLibrarySelection('Library created. Save or select templates in this library.');
+            renderTemplateLibrary(data.library || data);
+            templateLibraryStatus.innerText = 'Created library: ' + label;
         }
 
-        async function downloadTemplateLibrary() {
-            templateLibraryStatus.innerText = 'Preparing library download...';
-            var res = await fetch('/template_library/download');
-            if (!res.ok) {
-                templateLibraryStatus.innerText = 'Failed to download template library.';
+        async function renameActiveTemplateLibrary() {
+            var libraryId = templateLibraryVersionSelect.value;
+            var label = templateLibraryNameInput.value.trim();
+            if (!libraryId || !label) {
+                templateLibraryStatus.innerText = 'Select a library and enter a new name.';
                 return;
             }
-            var blob = await res.blob();
-            var url = URL.createObjectURL(blob);
-            var a = document.createElement('a');
-            var cd = res.headers.get('content-disposition') || '';
-            var m = cd.match(/filename=\"?([^\";]+)\"?/i);
-            a.href = url;
-            a.download = m ? m[1] : 'template_library.json';
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
-            templateLibraryStatus.innerText = 'Version downloaded: ' + (templateLibraryVersionSelect.options[templateLibraryVersionSelect.selectedIndex] ? templateLibraryVersionSelect.options[templateLibraryVersionSelect.selectedIndex].text : 'template library');
-        }
-
-        async function uploadTemplateLibrary() {
-            var file = templateLibraryFileInput.files && templateLibraryFileInput.files[0];
-            if (!file) {
-                templateLibraryStatus.innerText = 'Select a JSON file first.';
-                return;
-            }
-            templateLibraryStatus.innerText = 'Uploading template library...';
-            var fd = new FormData();
-            fd.append('file', file);
-            var res = await fetch('/template_library/upload', {
+            templateLibraryStatus.innerText = 'Renaming library...';
+            var res = await fetch('/template_library/rename_library', {
                 method: 'POST',
-                body: fd
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ library_id: libraryId, label: label })
             });
             var data = await res.json();
             if (!res.ok || data.error) {
-                templateLibraryStatus.innerText = (data && data.error) || 'Failed to upload template library.';
+                templateLibraryStatus.innerText = (data && data.error) || 'Failed to rename library.';
                 return;
             }
-            templateLibraryFileInput.value = '';
-            resetSavedLibrarySelection('Library imported. Re-select a saved template or category.');
-            activeLibraryVersionId = data.library ? data.library.active_version_id : null;
-            renderTemplateLibrary(data.library || { categories: [], template_count: 0 });
-            templateLibraryStatus.innerText = 'Imported ' + (data.imported_version_count || 0) + ' version(s), ' + (data.template_count || 0) + ' templates';
+            renderTemplateLibrary(data);
+            templateLibraryStatus.innerText = 'Renamed library: ' + label;
+        }
+
+        async function deleteActiveTemplateLibrary() {
+            var libraryId = templateLibraryVersionSelect.value;
+            var libraryLabel = templateLibraryVersionSelect.options[templateLibraryVersionSelect.selectedIndex]
+                ? templateLibraryVersionSelect.options[templateLibraryVersionSelect.selectedIndex].text
+                : 'this library';
+            if (!libraryId) {
+                templateLibraryStatus.innerText = 'No library selected.';
+                return;
+            }
+            if (!window.confirm('Delete template library "' + libraryLabel + '"?')) {
+                return;
+            }
+            templateLibraryStatus.innerText = 'Deleting library...';
+            var res;
+            var data;
+            try {
+                res = await fetch('/template_library/delete_library', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ library_id: libraryId })
+                });
+                data = await res.json();
+            } catch (err) {
+                templateLibraryStatus.innerText = 'Failed to delete library. Check that the server is running the latest code.';
+                return;
+            }
+            if (!res.ok || data.error) {
+                templateLibraryStatus.innerText = (data && (data.error || data.detail)) || 'Failed to delete library.';
+                return;
+            }
+            resetSavedLibrarySelection('Library deleted. Re-select a saved template or category.');
+            renderTemplateLibrary(data);
+            await loadTemplateLibrary('Deleted library. Active library: ' + (data.active_library_label || data.active_version_label || 'Unknown'));
+        }
+
+        async function deleteActiveTemplateLibraryVersion() {
+            await deleteActiveTemplateLibrary();
+        }
+
+        window.deleteActiveTemplateLibrary = deleteActiveTemplateLibrary;
+        window.deleteActiveTemplateLibraryVersion = deleteActiveTemplateLibraryVersion;
+        if (btnDeleteLibrary) {
+            btnDeleteLibrary.addEventListener('click', function () {
+                deleteActiveTemplateLibrary();
+            });
         }
 
         async function deleteSavedTemplate(templateId, templateName) {
@@ -1007,8 +1041,41 @@
             ) {
                 resetSavedLibrarySelection('Saved template deleted. Re-select a saved template or category.');
             }
-            renderTemplateLibrary(data);
-            templateLibraryStatus.innerText = 'Deleted template: ' + templateName;
+            await loadTemplateLibrary('Deleted template: ' + templateName);
+        }
+
+        async function deleteSavedCategory(categoryName, templateCount) {
+            if (!window.confirm('Delete category "' + categoryName + '" and its ' + templateCount + ' template(s)?')) {
+                return;
+            }
+            templateLibraryStatus.innerText = 'Deleting category: ' + categoryName + '...';
+            var res;
+            var data;
+            try {
+                res = await fetch('/template_library/delete_category', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ category: categoryName })
+                });
+                data = await res.json();
+            } catch (err) {
+                templateLibraryStatus.innerText = 'Failed to delete category. Check that the server is running the latest code.';
+                return;
+            }
+            if (!res.ok || data.error) {
+                templateLibraryStatus.innerText = (data && (data.error || data.detail)) || 'Failed to delete category.';
+                return;
+            }
+            if (
+                (currentTemplate && currentTemplate.category === categoryName) ||
+                (currentTemplateBundle && currentTemplateBundle.category === categoryName)
+            ) {
+                resetSavedLibrarySelection('Saved category deleted. Re-select a saved template or category.');
+            }
+            var message = 'Deleted category: ' + categoryName + ' (' + (data.deleted_count || 0) + ' templates)';
+            renderTemplateLibrary(data.library || { categories: [], template_count: 0 });
+            templateLibraryStatus.innerText = message;
+            await loadTemplateLibrary(message);
         }
 
         async function deleteLoadedSavedTemplate() {
@@ -2258,6 +2325,7 @@
 
         updateSelectionHint();
         loadSettingsSchema();
+        loadTemplateLibrary();
     </script>
 </body>
 

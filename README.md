@@ -8,7 +8,7 @@ FastAPI-based DXF pattern scanner with a full-screen web UI for:
 - Running standard or fast template matching
 - Downloading matched results as DXF
 - Downloading matched result handles as JSON
-- Saving reusable templates into a versioned JSON library
+- Saving reusable templates into SQLite-backed libraries
 
 Line-like DXF entities are fingerprinted per source entity. The scanner does not
 globally merge neighboring lines before matching, so matched pattern entity counts
@@ -22,7 +22,7 @@ content is less likely to be visible but unselectable.
 
 - FastAPI backend in `app.py`
 - Single-page frontend in `templates/index.html`
-- Template library persisted at `data/template_library.json`
+- Template libraries persisted at `data/template_library.sqlite`
 
 ## Install
 
@@ -77,18 +77,17 @@ The UI includes a `Template Library` panel that supports:
 - Loading a category and scanning with all templates in that category
 - Deleting the currently loaded saved template
 - Deleting a specific saved template from the list
-- Switching active library versions
-- Deleting an entire library version
-- Downloading the active library version as JSON
-- Uploading JSON to import additional library versions
+- Creating, renaming, switching, and deleting template libraries
+- Deleting an entire category from the active library
 
-### Version Behavior
+### Library Behavior
 
-- The library supports multiple versions.
-- One version is active at a time.
-- JSON download exports the active version only.
-- Export filenames include the version label and timestamp.
-- If the last version is deleted, the app creates a new empty version automatically.
+- Templates are stored in SQLite at `data/template_library.sqlite`.
+- All libraries share this single app-wide SQLite file across browser sessions and server restarts.
+- Multiple libraries are supported.
+- One library is active at a time.
+- Existing `data/template_library.json` data is migrated into SQLite on first use.
+- If the last library is deleted, the app creates a new empty default library automatically.
 
 ## Upload Filters
 
@@ -120,12 +119,13 @@ Core routes currently exposed by the backend:
 - `GET /`
 - `GET /settings_schema`
 - `GET /template_library`
-- `GET /template_library/download`
-- `POST /template_library/upload`
-- `POST /template_library/select_version`
-- `POST /template_library/delete_version`
+- `POST /template_library/create_library`
+- `POST /template_library/rename_library`
+- `POST /template_library/select_library`
+- `POST /template_library/delete_library`
 - `POST /template_library/save`
 - `POST /template_library/delete_template`
+- `POST /template_library/delete_category`
 - `POST /template_library/resolve`
 - `POST /upload`
 - `POST /extract`
@@ -140,4 +140,4 @@ Core routes currently exposed by the backend:
 
 - The UI defaults to `Fast` scan mode.
 - The main canvas fills the full viewer area.
-- Template-library responses and the main page are returned with `no-store` cache headers to avoid stale UI after delete or version changes.
+- Template-library responses and the main page are returned with `no-store` cache headers to avoid stale UI after library changes.
