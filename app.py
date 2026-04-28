@@ -2171,12 +2171,8 @@ async def upload_dxf(
             viewbox_h = float(vb[3])
             if viewbox_w > 0 and viewbox_h > 0:
                 render_mapping = {
-                    "matrix": [
-                        float(v) for row in matrix.rows() for v in row
-                    ],
-                    "inv_matrix": [
-                        float(v) for row in inv.rows() for v in row
-                    ],
+                    "matrix": [float(v) for row in matrix.rows() for v in row],
+                    "inv_matrix": [float(v) for row in inv.rows() for v in row],
                     "viewbox_x": viewbox_x,
                     "viewbox_y": viewbox_y,
                     "viewbox_w": viewbox_w,
@@ -2207,11 +2203,7 @@ async def upload_dxf(
         "removed_circle_count": removed_circle_count,
         "removed_circle_groups": removed_circle_groups,
         "entity_count": len(cache_payload["fingerprints"]),
-        "coord_basis": (
-            "render_matrix"
-            if render_mapping
-            else "dxf_extents"
-        ),
+        "coord_basis": ("render_matrix" if render_mapping else "dxf_extents"),
         "svg_render_time_ms": svg_render_time_ms,
         "cache_build_time_ms": cache_build_time_ms,
         "svg": svg,
@@ -2460,9 +2452,7 @@ def _build_match(
 
     mf = [af] + [all_fp[i] for i in used]
     handle_ids = _unique_handle_ids(
-        handle_id
-        for feature in mf
-        for handle_id in feature.get("handleIDs", [])
+        handle_id for feature in mf for handle_id in feature.get("handleIDs", [])
     )
     selected = mf if max_highlights is None else mf[:max_highlights]
     hl = [
@@ -2526,6 +2516,141 @@ def _finalize_scan_stats(stats, total_start):
     return stats
 
 
+def _roi_box_from_pct(cache_payload, roi_pct):
+    if not isinstance(roi_pct, list) or len(roi_pct) != 2:
+        return None
+    if not all(isinstance(pt, list) and len(pt) >= 2 for pt in roi_pct):
+        return None
+    bounds = cache_payload["bounds"]
+    render_mapping = cache_payload.get("render_mapping")
+    try:
+        p1 = _render_pct_to_dxf_point(roi_pct[0], bounds, render_mapping)
+        p2 = _render_pct_to_dxf_point(roi_pct[1], bounds, render_mapping)
+    except (TypeError, ValueError):
+        return None
+    dxf_min_x = min(p1[0], p2[0])
+    dxf_max_x = max(p1[0], p2[0])
+    dxf_min_y = min(p1[1], p2[1])
+    dxf_max_y = max(p1[1], p2[1])
+    if dxf_max_x - dxf_min_x <= BOUNDS_EPS or dxf_max_y - dxf_min_y <= BOUNDS_EPS:
+        return None
+    return ShapelyPolygon(
+        [
+            (dxf_min_x, dxf_min_y),
+            (dxf_max_x, dxf_min_y),
+            (dxf_max_x, dxf_max_y),
+            (dxf_min_x, dxf_max_y),
+        ]
+    )
+
+
+def _feature_within_roi(feature, roi_box):
+    geom = feature.get("geometry") or {}
+    kind = geom.get("kind")
+    if kind == "circle":
+        try:
+            cx = float(geom["cx"])
+            cy = float(geom["cy"])
+            r = abs(float(geom["r"]))
+        except (KeyError, TypeError, ValueError):
+            return roi_box.covers(Point(feature["x"], feature["y"]))
+        return roi_box.covers(
+            ShapelyPolygon(
+                [
+                    (cx - r, cy - r),
+                    (cx + r, cy - r),
+                    (cx + r, cy + r),
+                    (cx - r, cy + r),
+                ]
+            )
+        )
+    if kind == "polyline":
+        try:
+            points = geom.get("points", [])
+            if len(points) >= 2:
+                return roi_box.covers(LineString(points))
+        except Exception:
+            pass
+    return roi_box.covers(Point(feature["x"], feature["y"]))
+
+
+def _apply_roi_filter(cache_payload, roi_pct):
+    """Filter fingerprints to ROI rectangle. roi_pct=[[x1,y1],[x2,y2]] in render-pct space."""
+    roi_box = _roi_box_from_pct(cache_payload, roi_pct)
+    if roi_box is None:
+        filtered_fp = []
+    else:
+        filtered_fp = [
+            f
+            for f in cache_payload["fingerprints"]
+            if _feature_within_roi(f, roi_box)
+        ]
+    if filtered_fp:
+        coords = np.array([[f["x"], f["y"]] for f in filtered_fp])
+        sizes = np.array([f["size"] for f in filtered_fp])
+        tree = cKDTree(coords)
+    else:
+        coords = np.empty((0, 2))
+        sizes = np.empty(0)
+        tree = None
+    type_index = {}
+    for idx, f in enumerate(filtered_fp):
+        type_index.setdefault(f["type"], []).append(idx)
+    type_index = {t: np.array(v) for t, v in type_index.items()}
+    return filtered_fp, tree, coords, sizes, type_index
+
+
+def _highlight_within_roi_pct(highlight, roi_pct):
+    if not isinstance(roi_pct, list) or len(roi_pct) != 2:
+        return True
+    try:
+        x1, y1 = float(roi_pct[0][0]), float(roi_pct[0][1])
+        x2, y2 = float(roi_pct[1][0]), float(roi_pct[1][1])
+    except (TypeError, ValueError, IndexError):
+        return True
+    min_x, max_x = min(x1, x2), max(x1, x2)
+    min_y, max_y = min(y1, y2), max(y1, y2)
+    kind = highlight.get("kind")
+    if kind == "circle":
+        try:
+            cx = float(highlight["cx_pct"])
+            cy = float(highlight["cy_pct"])
+            r = abs(float(highlight.get("r_pct", 0.0)))
+        except (TypeError, ValueError, KeyError):
+            return False
+        return (
+            min_x <= cx - r
+            and cx + r <= max_x
+            and min_y <= cy - r
+            and cy + r <= max_y
+        )
+    if kind == "polyline":
+        points = highlight.get("points_pct", [])
+        if not points:
+            return False
+        try:
+            return all(
+                min_x <= float(pt[0]) <= max_x and min_y <= float(pt[1]) <= max_y
+                for pt in points
+            )
+        except (TypeError, ValueError, IndexError):
+            return False
+    return False
+
+
+def _match_within_roi_pct(match, roi_pct):
+    highlights = match.get("highlights") or []
+    if not highlights:
+        return False
+    return all(_highlight_within_roi_pct(h, roi_pct) for h in highlights)
+
+
+def _filter_matches_to_roi_pct(matches, roi_pct):
+    if not roi_pct:
+        return matches
+    return [m for m in matches if _match_within_roi_pct(m, roi_pct)]
+
+
 @app.post("/scan")
 async def scan_dxf(template: dict = Body(...)):
     """Standard scan: cache + KD-Tree + bipartite matching (Python loop)."""
@@ -2570,6 +2695,13 @@ async def scan_dxf(template: dict = Body(...)):
     tree = cache_payload["tree"]
     type_index = cache_payload["type_index"]
     sizes = cache_payload["sizes"]
+
+    roi_pct = template.get("roi_pct")
+    if roi_pct and len(roi_pct) == 2:
+        all_fp, tree, _, sizes, type_index = _apply_roi_filter(cache_payload, roi_pct)
+        stats["roi_fp_count"] = len(all_fp)
+        stats["total_fp_count"] = len(cache_payload["fingerprints"])
+        stats["roi_pct"] = roi_pct
 
     template_id = template.get("template_id")
     if template_id:
@@ -2649,6 +2781,10 @@ async def scan_dxf(template: dict = Body(...)):
         stats["matching_ms"] = int((time.perf_counter() - t_matching) * 1000)
         stats["raw_match_count"] = len(matches_found)
         unique = _dedupe_and_sort_matches(matches_found)
+        if roi_pct:
+            before_roi_match_count = len(unique)
+            unique = _filter_matches_to_roi_pct(unique, roi_pct)
+            stats["roi_match_reject_count"] = before_roi_match_count - len(unique)
         stats["unique_match_count"] = len(unique)
         return {
             "match_count": len(unique),
@@ -2794,6 +2930,10 @@ async def scan_dxf(template: dict = Body(...)):
     stats["matching_ms"] = int((time.perf_counter() - t_matching) * 1000)
     stats["raw_match_count"] = len(matches_found)
     unique = _dedupe_and_sort_matches(matches_found)
+    if roi_pct:
+        before_roi_match_count = len(unique)
+        unique = _filter_matches_to_roi_pct(unique, roi_pct)
+        stats["roi_match_reject_count"] = before_roi_match_count - len(unique)
     stats["unique_match_count"] = len(unique)
     return {
         "match_count": len(unique),
@@ -2850,6 +2990,15 @@ async def scan_dxf_fast(template: dict = Body(...)):
     sizes = cache_payload["sizes"]
     tree = cache_payload["tree"]
     type_index = cache_payload["type_index"]
+
+    roi_pct = template.get("roi_pct")
+    if roi_pct and len(roi_pct) == 2:
+        all_fp, tree, coords, sizes, type_index = _apply_roi_filter(
+            cache_payload, roi_pct
+        )
+        stats["roi_fp_count"] = len(all_fp)
+        stats["total_fp_count"] = len(cache_payload["fingerprints"])
+        stats["roi_pct"] = roi_pct
 
     template_id = template.get("template_id")
     if template_id:
@@ -2930,6 +3079,10 @@ async def scan_dxf_fast(template: dict = Body(...)):
         stats["matching_ms"] = int((time.perf_counter() - t_matching) * 1000)
         stats["raw_match_count"] = len(matches_found)
         unique = _dedupe_and_sort_matches(matches_found)
+        if roi_pct:
+            before_roi_match_count = len(unique)
+            unique = _filter_matches_to_roi_pct(unique, roi_pct)
+            stats["roi_match_reject_count"] = before_roi_match_count - len(unique)
         stats["unique_match_count"] = len(unique)
         return {
             "match_count": len(unique),
@@ -3136,6 +3289,10 @@ async def scan_dxf_fast(template: dict = Body(...)):
     stats["matching_ms"] = int((time.perf_counter() - t_matching) * 1000)
     stats["raw_match_count"] = len(matches_found)
     unique = _dedupe_and_sort_matches(matches_found)
+    if roi_pct:
+        before_roi_match_count = len(unique)
+        unique = _filter_matches_to_roi_pct(unique, roi_pct)
+        stats["roi_match_reject_count"] = before_roi_match_count - len(unique)
     stats["unique_match_count"] = len(unique)
     return {
         "match_count": len(unique),

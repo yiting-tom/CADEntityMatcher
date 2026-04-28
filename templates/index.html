@@ -468,6 +468,14 @@
                     <label><input type="radio" name="scan-mode" value="/scan_fast" checked> Fast</label>
                     <button id="btn-scan" onclick="scanTemplate()" disabled>Run Scan</button>
                 </div>
+                <div class="toolbar-group">
+                    <span>Scan ROI</span>
+                    <label><input type="checkbox" id="roi-enabled"> Enable</label>
+                    <input type="text" id="roi-name-input" placeholder="ROI name" style="width:110px;"
+                        title="Name prefix for the downloaded JSON file">
+                    <button class="btn-sm" id="btn-clear-roi" onclick="clearRoi()" disabled>Clear ROI</button>
+                    <span id="roi-status" style="font-size:12px;color:#ffa000;min-width:60px;"></span>
+                </div>
             </div>
         </header>
 
@@ -478,6 +486,7 @@
                     <svg id="svg-overlay"
                         style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:10;">
                         <g id="removed-group"></g>
+                        <g id="roi-group"></g>
                         <g id="poly-group"></g>
                         <g id="template-group"></g>
                         <g id="hl-group"></g>
@@ -501,10 +510,12 @@
                         <summary>Template Library</summary>
                         <div class="details-body">
                             <div class="library-save-fields">
-                                <select id="template-library-version" class="setting-input" onchange="changeTemplateLibraryVersion()">
+                                <select id="template-library-version" class="setting-input"
+                                    onchange="changeTemplateLibraryVersion()">
                                     <option value="">Loading versions...</option>
                                 </select>
-                                <button class="btn-sm btn-danger" type="button" onclick="deleteActiveTemplateLibraryVersion()">
+                                <button class="btn-sm btn-danger" type="button"
+                                    onclick="deleteActiveTemplateLibraryVersion()">
                                     Delete Version
                                 </button>
                                 <input id="saved-template-name" class="setting-input" type="text"
@@ -522,8 +533,10 @@
                             <div class="library-transfer-row">
                                 <input id="template-library-file" type="file" accept=".json,application/json">
                                 <div style="display:flex; gap:8px; flex-wrap:wrap;">
-                                    <button class="btn-sm" onclick="uploadTemplateLibrary()">Upload Library JSON</button>
-                                    <button class="btn-sm" onclick="downloadTemplateLibrary()">Download Library JSON</button>
+                                    <button class="btn-sm" onclick="uploadTemplateLibrary()">Upload Library
+                                        JSON</button>
+                                    <button class="btn-sm" onclick="downloadTemplateLibrary()">Download Library
+                                        JSON</button>
                                 </div>
                             </div>
                             <p id="template-library-status" class="setting-meta library-status">Loading template
@@ -569,6 +582,7 @@
         const svgOverlay = document.getElementById('svg-overlay');
         const uploadResult = document.getElementById('upload-result');
         const removedG = document.getElementById('removed-group');
+        const roiG = document.getElementById('roi-group');
         const polyG = document.getElementById('poly-group');
         const tmplG = document.getElementById('template-group');
         const hlG = document.getElementById('hl-group');
@@ -604,6 +618,9 @@
         let activeLibraryCategory = null;
         let contentW = 0, contentH = 0;
         let svgViewport = { x0: 0, y0: 0, w: 0, h: 0 };
+        // ROI state
+        let roiEnabled = false, roiDragging = false;
+        let roiStart = null, roiEnd = null, roiPct = null;
         const MAX_TEMPLATE_HIGHLIGHTS_TO_DRAW = 250;
         const MAX_MATCHES_TO_DRAW = 200;
         const MAX_HIGHLIGHTS_PER_MATCH_TO_DRAW = 80;
@@ -1159,9 +1176,11 @@
         }
 
         function updateSelectionHint() {
-            selectionHint.innerText = selectorMode === 'click'
+            var roiHint = roiEnabled ? ' | ROI: Ctrl+drag to set scan region.' : '';
+            selectionHint.innerText = (selectorMode === 'click'
                 ? 'Click to select one feature. Hold Shift and click to add or remove features. Right-drag to pan. Scroll to zoom. Press ESC to clear.'
-                : 'Left-click to add vertex. Double-click or click the first point to close. Right-drag to pan. Scroll to zoom. Press ESC to clear.';
+                : 'Left-click to add vertex. Double-click or click the first point to close. Right-drag to pan. Scroll to zoom. Press ESC to clear.')
+                + roiHint;
         }
 
         function setSelectorMode(mode) {
@@ -1288,6 +1307,11 @@
         // --- Transform ---
         function applyTransform() {
             wrapper.style.transform = 'translate(' + panX + 'px,' + panY + 'px) scale(' + scale + ')';
+            if (roiPct && !roiDragging) {
+                var a = svgPctToContent(roiPct[0][0], roiPct[0][1]);
+                var b = svgPctToContent(roiPct[1][0], roiPct[1][1]);
+                drawRoiRect(a, b);
+            }
         }
         function syncCanvasSize() {
             contentW = container.clientWidth;
@@ -1427,24 +1451,25 @@
             URL.revokeObjectURL(url);
         }
         function buildMatchesJsonPayload() {
-            return (currentMatchResult && currentMatchResult.matches ? currentMatchResult.matches : []).map(function (match, idx) {
-                return {
-                    match_index: idx,
-                    template_name: match.template_name || null,
-                    template_category: match.template_category || null,
-                    dxf_x: match.dxf_x,
-                    dxf_y: match.dxf_y,
-                    render_pct_x: match.render_pct_x,
-                    render_pct_y: match.render_pct_y,
-                    match_score: match.match_score,
-                    handleIDs: match.handleIDs || [],
-                };
+            var matches = currentMatchResult && currentMatchResult.matches ? currentMatchResult.matches : [];
+            var result = {};
+            var roiName = (roiEnabled && document.getElementById('roi-name-input').value.trim()) || '';
+            matches.forEach(function (match) {
+                var category = (match.template_category || 'Uncategorized').trim();
+                var name = (match.template_name || 'Unknown').trim();
+                var key = (roiName ? roiName + '.' : '') + category + '.' + name;
+                if (!result[key]) result[key] = [];
+                result[key].push(match.handleIDs || []);
             });
+            return result;
         }
         function downloadMatchesJson() {
             if (!currentMatchResult || !currentMatchResult.matches || !currentMatchResult.matches.length) return;
-            var suffix = currentCacheId ? currentCacheId.slice(0, 8) : 'matches';
-            downloadJson('matched_entities_' + suffix + '.json', buildMatchesJsonPayload());
+            var payload = buildMatchesJsonPayload();
+            var keys = Object.keys(payload);
+            var baseName = keys.length === 1 ? keys[0] : keys[0] + '_and_more';
+            var filename = baseName + '.json';
+            downloadJson(filename, payload);
         }
         async function downloadMatchedDXF() {
             if (!currentMatchResult || !currentCacheId) return;
@@ -1575,6 +1600,7 @@
         // --- Polygon selection ---
         container.addEventListener('click', async function (e) {
             if (e.button !== 0 || isPanning || !contentW) return;
+            if (roiEnabled && e.ctrlKey) return;
             var pt = screenToContent(e.clientX, e.clientY);
             if (selectorMode === 'click') {
                 if (e.detail >= 2) return;
@@ -1956,12 +1982,94 @@
             clearPoly(true); hlG.innerHTML = '';
             removedHighlights = [];
             removedG.innerHTML = '';
+            clearRoi();
             currentCacheId = null;
             resetView();
             document.getElementById('scan-status').innerText = '';
             document.getElementById('scan-result').innerText = 'Waiting for scan...';
             setMatchButtonsEnabled(false);
         }
+
+        // --- ROI ---
+        function clearRoi() {
+            roiPct = null; roiStart = null; roiEnd = null; roiDragging = false;
+            roiG.innerHTML = '';
+            document.getElementById('roi-status').innerText = '';
+            document.getElementById('btn-clear-roi').disabled = true;
+        }
+
+        function drawRoiRect(a, b) {
+            var NS = 'http://www.w3.org/2000/svg';
+            roiG.innerHTML = '';
+            var x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
+            var w = Math.abs(b.x - a.x), h = Math.abs(b.y - a.y);
+            var rect = document.createElementNS(NS, 'rect');
+            rect.setAttribute('x', x); rect.setAttribute('y', y);
+            rect.setAttribute('width', w); rect.setAttribute('height', h);
+            rect.setAttribute('fill', 'rgba(255,160,0,0.08)');
+            rect.setAttribute('stroke', '#ffa000');
+            rect.setAttribute('stroke-width', 2 / scale);
+            rect.setAttribute('stroke-dasharray', (6 / scale) + ' ' + (4 / scale));
+            roiG.appendChild(rect);
+            var roiName = document.getElementById('roi-name-input').value.trim();
+            if (roiName) {
+                var fontSize = Math.max(12 / scale, 1);
+                var txt = document.createElementNS(NS, 'text');
+                txt.setAttribute('x', x + 6 / scale);
+                txt.setAttribute('y', y + fontSize + 4 / scale);
+                txt.setAttribute('fill', '#ffa000');
+                txt.setAttribute('stroke', '#000');
+                txt.setAttribute('stroke-width', 3 / scale);
+                txt.setAttribute('paint-order', 'stroke');
+                txt.setAttribute('font-size', fontSize);
+                txt.setAttribute('font-family', 'ui-monospace,monospace');
+                txt.setAttribute('pointer-events', 'none');
+                txt.textContent = roiName;
+                roiG.appendChild(txt);
+            }
+        }
+
+        document.getElementById('roi-enabled').addEventListener('change', function () {
+            roiEnabled = this.checked;
+            if (!roiEnabled) clearRoi();
+            updateSelectionHint();
+        });
+
+        document.getElementById('roi-name-input').addEventListener('input', function () {
+            if (roiPct && !roiDragging) {
+                var a = svgPctToContent(roiPct[0][0], roiPct[0][1]);
+                var b = svgPctToContent(roiPct[1][0], roiPct[1][1]);
+                drawRoiRect(a, b);
+            }
+        });
+
+        container.addEventListener('mousedown', function (e) {
+            if (!roiEnabled || e.button !== 0 || !e.ctrlKey) return;
+            e.preventDefault(); e.stopPropagation();
+            roiDragging = true;
+            roiStart = screenToContent(e.clientX, e.clientY);
+            roiEnd = roiStart;
+            roiG.innerHTML = '';
+        }, true);
+
+        window.addEventListener('mousemove', function (e) {
+            if (!roiDragging) return;
+            roiEnd = screenToContent(e.clientX, e.clientY);
+            drawRoiRect(roiStart, roiEnd);
+        });
+
+        window.addEventListener('mouseup', function (e) {
+            if (!roiDragging) return;
+            roiDragging = false;
+            if (!roiStart || !roiEnd) return;
+            var dx = Math.abs(roiEnd.x - roiStart.x), dy = Math.abs(roiEnd.y - roiStart.y);
+            if (dx < 4 / scale && dy < 4 / scale) { roiG.innerHTML = ''; return; }
+            roiPct = [contentToSvgPct(roiStart), contentToSvgPct(roiEnd)];
+            drawRoiRect(roiStart, roiEnd);
+            var roiName = document.getElementById('roi-name-input').value.trim();
+            document.getElementById('roi-status').innerText = roiName ? roiName + ' set' : 'ROI set';
+            document.getElementById('btn-clear-roi').disabled = false;
+        });
 
         // --- Scan ---
         function buildScanPayload(templateLike) {
@@ -1974,6 +2082,7 @@
             }
             payload.plugins = collectSelectedPlugins();
             payload.settings = collectRuntimeSettings();
+            if (roiEnabled && roiPct) payload.roi_pct = roiPct;
             return payload;
         }
 
@@ -2063,7 +2172,14 @@
                 document.getElementById('scan-status').innerText =
                     'Category scan complete! Found ' + data.match_count + ' matches across ' + (currentTemplateBundle.templates || []).length + ' templates (' + elapsed + 's)';
             } else {
-                document.getElementById('scan-status').innerText = 'Scan complete! Found ' + data.match_count + ' matches (' + elapsed + 's)';
+                var roiInfo = (data.scan_stats && data.scan_stats.roi_fp_count !== undefined)
+                    ? ' [ROI: ' + data.scan_stats.roi_fp_count + '/' + data.scan_stats.total_fp_count + ' entities]'
+                    : '';
+                var roiRejectInfo = (data.scan_stats && data.scan_stats.roi_match_reject_count)
+                    ? ' [ROI rejected matches: ' + data.scan_stats.roi_match_reject_count + ']'
+                    : '';
+                document.getElementById('scan-status').innerText = 'Scan complete! Found ' + data.match_count + ' matches (' + elapsed + 's)' + roiInfo;
+                document.getElementById('scan-status').innerText += roiRejectInfo;
             }
             var noHighlightMatches = (data.matches || []).filter(function (m) {
                 return (m.highlight_count_total || 0) > 0 && (m.highlight_count_returned || 0) === 0;
