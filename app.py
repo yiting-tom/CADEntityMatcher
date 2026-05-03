@@ -6,16 +6,19 @@ import sqlite3
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Callable
+import socket
+from typing import Any, Callable, Optional
 import numpy as np
 from scipy.spatial import cKDTree
 from scipy.optimize import linear_sum_assignment
-from fastapi import FastAPI, UploadFile, File, Body, Form
+from fastapi import FastAPI, UploadFile, File, Body, Form, Query
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 import ezdxf
 from ezdxf.bbox import extents
@@ -350,6 +353,59 @@ class EntityModel(BaseModel):
 
 class TemplateModel(BaseModel):
     entities: list[EntityModel]
+
+
+class AgentViewProposal(BaseModel):
+    name: str
+    roi_pct: Optional[list[list[float]]] = None
+    confidence: Optional[float] = None
+    source: Optional[str] = None
+
+
+class AgentSeedCandidate(BaseModel):
+    target_class: str = "SMD"
+    view_name: Optional[str] = None
+    label: Optional[str] = None
+    template_id: Optional[str] = None
+    entities: list[dict[str, Any]] = Field(default_factory=list)
+    group_center: Optional[dict[str, float]] = None
+    click_pct: Optional[list[float]] = None
+    polygon_pct: Optional[list[list[float]]] = None
+    confidence: Optional[float] = None
+    source: Optional[str] = None
+
+
+class AgentProviderConfig(BaseModel):
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    llm_model: Optional[str] = None
+    vlm_model: Optional[str] = None
+    timeout_seconds: Optional[float] = None
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+    send_image: bool = False
+
+
+class AgentRunRequest(BaseModel):
+    cache_id: str
+    instruction: str
+    target_classes: list[str] = Field(default_factory=lambda: ["SMD"])
+    target_descriptions: dict[str, str] = Field(default_factory=dict)
+    views: list[AgentViewProposal] = Field(default_factory=list)
+    seed_candidates: list[AgentSeedCandidate] = Field(default_factory=list)
+    plugins: list[str] = Field(default_factory=list)
+    settings: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentProposeRequest(BaseModel):
+    cache_id: str
+    instruction: str
+    target_classes: list[str] = Field(default_factory=lambda: ["SMD"])
+    target_descriptions: dict[str, str] = Field(default_factory=dict)
+    views: list[AgentViewProposal] = Field(default_factory=list)
+    settings: dict[str, Any] = Field(default_factory=dict)
+    provider: Optional[AgentProviderConfig] = None
+    render_image_data_url: Optional[str] = None
 
 
 def _coerce_runtime_config(raw):
@@ -2329,6 +2385,1324 @@ def _resolve_score_max(template, config):
     return _clamp01(v)
 
 
+def _clamp_pct_pair(pt):
+    if not isinstance(pt, list) or len(pt) < 2:
+        return None
+    try:
+        return [_clamp01(float(pt[0])), _clamp01(float(pt[1]))]
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_roi_pct(roi_pct):
+    if not isinstance(roi_pct, list) or len(roi_pct) != 2:
+        return None
+    p1 = _clamp_pct_pair(roi_pct[0])
+    p2 = _clamp_pct_pair(roi_pct[1])
+    if not p1 or not p2:
+        return None
+    if math.isclose(p1[0], p2[0]) or math.isclose(p1[1], p2[1]):
+        return None
+    return [
+        [min(p1[0], p2[0]), min(p1[1], p2[1])],
+        [max(p1[0], p2[0]), max(p1[1], p2[1])],
+    ]
+
+
+# --- Region segmentation for agent proposal ---
+
+VIEW_GRID_SIZE_DEFAULT = 32
+VIEW_MIN_REGION_CELLS_DEFAULT = 4
+VIEW_CLOSE_KERNEL_DEFAULT = 0
+VIEW_CONNECTIVITY_DEFAULT = 4
+VIEW_DENSITY_QUANTILE_DEFAULT = 0.10
+# Conservative thresholds: every label other than `view` requires positive evidence.
+# Chip package drawings often have no table at all; default must be `view`.
+TEXT_RATIO_TABLE_THRESHOLD = 0.40
+DIMENSION_RATIO_THRESHOLD = 0.30
+REGION_ASPECT_TITLE_THRESHOLD = 6.0
+REGION_EDGE_PROXIMITY_RATIO = 0.05
+REGION_CIRCLE_RATIO_VIEW = 0.10
+REGION_LABELS = {"view", "detail", "table", "title_block", "dimension", "note", "unknown"}
+REGION_PIPELINE_LABELS = {"view", "detail"}
+# extract_template_features folds LINE/LWPOLYLINE/ARC/POLYLINE/ELLIPSE/SPLINE into COMPOSITE_SHAPE.
+REGION_STRUCTURAL_TYPES = ("COMPOSITE_SHAPE",)
+REGION_TEXT_TYPES = ("TEXT", "MTEXT", "ATTRIB", "ATTDEF")
+REGION_DIMENSION_TYPES = ("DIMENSION", "LEADER")
+# Canonical target classes the agent pipeline can extract.
+AGENT_TARGET_CLASSES = ("SMD", "Substrate", "Die area", "Alignment mark")
+
+
+def _compute_density_grid(cache_payload, gx=VIEW_GRID_SIZE_DEFAULT, gy=None):
+    """Bin fingerprint centers into a gx*gy density grid. Row 0 = top of render."""
+    if gy is None:
+        gy = gx
+    bounds = cache_payload.get("bounds") or {}
+    width = float(bounds.get("width") or 0.0)
+    height = float(bounds.get("height") or 0.0)
+    fingerprints = cache_payload.get("fingerprints") or []
+    grid = np.zeros((gy, gx), dtype=np.int32)
+    if width <= 0 or height <= 0 or not fingerprints:
+        return {"grid": grid, "gx": gx, "gy": gy, "bounds": bounds}
+    min_x = float(bounds["min_x"])
+    max_y = float(bounds["max_y"])
+    for f in fingerprints:
+        u = (float(f.get("x", 0.0)) - min_x) / width
+        v = (max_y - float(f.get("y", 0.0))) / height
+        ix = min(gx - 1, max(0, int(u * gx)))
+        iy = min(gy - 1, max(0, int(v * gy)))
+        grid[iy, ix] += 1
+    return {"grid": grid, "gx": gx, "gy": gy, "bounds": bounds}
+
+
+def _morph_close_grid(mask, kernel=VIEW_CLOSE_KERNEL_DEFAULT):
+    """Square-kernel morphological closing on a 2D binary grid."""
+    if kernel <= 0 or mask.size == 0:
+        return mask
+    h, w = mask.shape
+    k = int(kernel)
+
+    def _shift_or(out, src):
+        for dy in range(-k, k + 1):
+            for dx in range(-k, k + 1):
+                ys = slice(max(0, dy), h + min(0, dy))
+                xs = slice(max(0, dx), w + min(0, dx))
+                ys_src = slice(max(0, -dy), h + min(0, -dy))
+                xs_src = slice(max(0, -dx), w + min(0, -dx))
+                out[ys, xs] |= src[ys_src, xs_src]
+
+    def _shift_and(out, src):
+        for dy in range(-k, k + 1):
+            for dx in range(-k, k + 1):
+                ys = slice(max(0, dy), h + min(0, dy))
+                xs = slice(max(0, dx), w + min(0, dx))
+                ys_src = slice(max(0, -dy), h + min(0, -dy))
+                xs_src = slice(max(0, -dx), w + min(0, -dx))
+                shifted = np.zeros_like(src)
+                shifted[ys, xs] = src[ys_src, xs_src]
+                out &= shifted
+
+    dilated = np.zeros_like(mask)
+    _shift_or(dilated, mask)
+    eroded = np.ones_like(dilated)
+    _shift_and(eroded, dilated)
+    return eroded
+
+
+def _label_connected_regions(
+    density,
+    min_cells=VIEW_MIN_REGION_CELLS_DEFAULT,
+    close_kernel=VIEW_CLOSE_KERNEL_DEFAULT,
+    connectivity=VIEW_CONNECTIVITY_DEFAULT,
+    density_quantile=VIEW_DENSITY_QUANTILE_DEFAULT,
+):
+    """Connected-component labeling on a density grid; returns list of region dicts.
+
+    A cell is "occupied" iff its count >= the q-th quantile of all nonzero counts
+    (default q=0.10 trims sparse bridge cells from dimension/border lines).
+    """
+    grid = density["grid"]
+    gx = density["gx"]
+    gy = density["gy"]
+    if grid.size == 0 or grid.sum() == 0:
+        return []
+    nonzero = grid[grid > 0]
+    if density_quantile > 0 and nonzero.size > 0:
+        floor = float(np.quantile(nonzero, _clamp01(density_quantile)))
+        floor = max(floor, 1.0)
+    else:
+        floor = 1.0
+    mask = (grid >= floor).astype(np.uint8)
+    if mask.sum() == 0:
+        mask = (grid > 0).astype(np.uint8)
+    mask = _morph_close_grid(mask, close_kernel)
+    h, w = mask.shape
+    if connectivity == 8:
+        offsets = [(dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1) if (dy, dx) != (0, 0)]
+    else:
+        offsets = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    labels = -np.ones((h, w), dtype=np.int32)
+    next_label = 0
+    for sy in range(h):
+        for sx in range(w):
+            if mask[sy, sx] == 0 or labels[sy, sx] >= 0:
+                continue
+            stack = [(sy, sx)]
+            labels[sy, sx] = next_label
+            while stack:
+                cy, cx = stack.pop()
+                for dy, dx in offsets:
+                    ny, nx = cy + dy, cx + dx
+                    if (
+                        0 <= ny < h
+                        and 0 <= nx < w
+                        and mask[ny, nx]
+                        and labels[ny, nx] < 0
+                    ):
+                        labels[ny, nx] = next_label
+                        stack.append((ny, nx))
+            next_label += 1
+
+    regions = []
+    for label in range(next_label):
+        ys, xs = np.where(labels == label)
+        if ys.size < min_cells:
+            continue
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        entity_count = int(sum(int(grid[y, x]) for y, x in zip(ys.tolist(), xs.tolist())))
+        regions.append(
+            {
+                "id": f"region_{label:02d}",
+                "roi_pct": [[x0 / gx, y0 / gy], [x1 / gx, y1 / gy]],
+                "cell_count": int(ys.size),
+                "entity_count": entity_count,
+                "grid_bbox": [x0, y0, x1, y1],
+            }
+        )
+    regions.sort(key=lambda r: -r["entity_count"])
+    return regions
+
+
+def _region_dxf_bbox(region, bounds):
+    """Convert a render-pct ROI to a DXF-space bbox."""
+    (x0_pct, y0_pct), (x1_pct, y1_pct) = region["roi_pct"]
+    width = float(bounds["width"])
+    height = float(bounds["height"])
+    dxf_min_x = bounds["min_x"] + x0_pct * width
+    dxf_max_x = bounds["min_x"] + x1_pct * width
+    dxf_max_y = bounds["max_y"] - y0_pct * height
+    dxf_min_y = bounds["max_y"] - y1_pct * height
+    return dxf_min_x, dxf_min_y, dxf_max_x, dxf_max_y
+
+
+def _region_features(cache_payload, region):
+    """Compute geometry-only features for a region (no LLM)."""
+    bounds = cache_payload["bounds"]
+    fingerprints = cache_payload.get("fingerprints") or []
+    dxf_min_x, dxf_min_y, dxf_max_x, dxf_max_y = _region_dxf_bbox(region, bounds)
+    type_counts = {}
+    sizes = []
+    members = 0
+    for f in fingerprints:
+        x = float(f.get("x", 0.0))
+        y = float(f.get("y", 0.0))
+        if not (dxf_min_x <= x <= dxf_max_x and dxf_min_y <= y <= dxf_max_y):
+            continue
+        members += 1
+        ftype = f.get("type") or "UNKNOWN"
+        type_counts[ftype] = type_counts.get(ftype, 0) + 1
+        sz = float(f.get("size") or 0.0)
+        if sz > 0:
+            sizes.append(sz)
+
+    rwidth = max(dxf_max_x - dxf_min_x, BOUNDS_EPS)
+    rheight = max(dxf_max_y - dxf_min_y, BOUNDS_EPS)
+    aspect = max(rwidth, rheight) / min(rwidth, rheight)
+    bw = max(float(bounds["width"]), BOUNDS_EPS)
+    bh = max(float(bounds["height"]), BOUNDS_EPS)
+    area_ratio = (rwidth * rheight) / (bw * bh)
+    edge_proximity = min(
+        (dxf_min_x - bounds["min_x"]) / bw,
+        (bounds["max_x"] - dxf_max_x) / bw,
+        (dxf_min_y - bounds["min_y"]) / bh,
+        (bounds["max_y"] - dxf_max_y) / bh,
+    )
+    if members > 0:
+        type_dist = {t: c / members for t, c in type_counts.items()}
+    else:
+        type_dist = {}
+    structural_share = sum(type_dist.get(t, 0.0) for t in REGION_STRUCTURAL_TYPES)
+    text_share = sum(type_dist.get(t, 0.0) for t in REGION_TEXT_TYPES)
+    dimension_share = sum(type_dist.get(t, 0.0) for t in REGION_DIMENSION_TYPES)
+    circle_share = type_dist.get("CIRCLE", 0.0)
+    composite_share = type_dist.get("COMPOSITE_SHAPE", 0.0)
+
+    repetition_entropy = 1.0
+    if sizes:
+        arr = np.asarray(sizes, dtype=np.float64)
+        if arr.size > 1 and arr.max() > 0:
+            buckets = np.histogram(np.log10(arr.clip(min=1e-9)), bins=20)[0]
+            total = buckets.sum()
+            if total > 0:
+                probs = buckets / total
+                nz = probs[probs > 0]
+                if nz.size > 0:
+                    ent = float(-(nz * np.log2(nz)).sum())
+                    repetition_entropy = ent / math.log2(max(2, nz.size))
+
+    return {
+        "entity_count": members,
+        "type_dist": {t: round(v, 4) for t, v in type_dist.items()},
+        "structural_share": round(structural_share, 4),
+        "circle_share": round(circle_share, 4),
+        "text_share": round(text_share, 4),
+        "dimension_share": round(dimension_share, 4),
+        "composite_share": round(composite_share, 4),
+        "size_mean": round(float(np.mean(sizes)) if sizes else 0.0, 4),
+        "size_std": round(float(np.std(sizes)) if sizes else 0.0, 4),
+        "aspect_ratio": round(float(aspect), 3),
+        "area_ratio": round(float(area_ratio), 4),
+        "edge_proximity": round(float(max(edge_proximity, 0.0)), 4),
+        "repetition_entropy": round(float(repetition_entropy), 4),
+        "dxf_bbox": [
+            round(dxf_min_x, 3),
+            round(dxf_min_y, 3),
+            round(dxf_max_x, 3),
+            round(dxf_max_y, 3),
+        ],
+    }
+
+
+def _classify_region_heuristic(features):
+    """Assign a label using only geometric features.
+
+    Default is `view`. Other labels only fire on positive evidence — chip
+    package drawings often have no table or title block at all, so we never
+    flip away from `view` on the absence of pad density alone.
+
+    Fingerprint type taxonomy in this codebase:
+      - CIRCLE: SMD pads, alignment marks
+      - COMPOSITE_SHAPE: every line/polyline/arc/ellipse/spline (package outline,
+        substrate traces, table grid lines, dimension shafts all collapse here)
+      - TEXT/MTEXT/ATTRIB: notes, table contents, title block labels
+      - DIMENSION/LEADER: dimension annotations
+    """
+    if features["entity_count"] <= 0:
+        return {"label": "unknown", "confidence": 0.0, "reasons": ["empty_region"]}
+    aspect = features["aspect_ratio"]
+    edge = features["edge_proximity"]
+    circle_share = features["circle_share"]
+    text_share = features["text_share"]
+    dimension_share = features["dimension_share"]
+    composite_share = features["composite_share"]
+    repetition = features["repetition_entropy"]
+    area = features["area_ratio"]
+
+    # Dimension strip: leader/dimension entities dominate, OR the region is a
+    # very thin strip near an edge with no pads or text.
+    if dimension_share >= DIMENSION_RATIO_THRESHOLD:
+        return {
+            "label": "dimension",
+            "confidence": 0.7,
+            "reasons": ["dimension_or_leader_dominated"],
+        }
+    if (
+        aspect >= REGION_ASPECT_TITLE_THRESHOLD * 1.5
+        and area < 0.05
+        and edge <= REGION_EDGE_PROXIMITY_RATIO
+        and circle_share < 0.02
+    ):
+        return {
+            "label": "dimension",
+            "confidence": 0.55,
+            "reasons": ["very_thin_edge_strip"],
+        }
+    # Note / table: text dominance only. We do NOT flip line-dominated regions
+    # to table — many real package views are mostly polylines (substrate
+    # traces, alignment marks), and false-positive tables hide them.
+    if text_share >= TEXT_RATIO_TABLE_THRESHOLD:
+        return {
+            "label": "note" if area < 0.04 else "table",
+            "confidence": 0.7,
+            "reasons": ["high_text_share"],
+        }
+    # Title block: thin region, hugs an edge, mostly lines, no pads.
+    if (
+        aspect >= REGION_ASPECT_TITLE_THRESHOLD
+        and edge <= REGION_EDGE_PROXIMITY_RATIO
+        and area < 0.10
+        and circle_share < 0.02
+        and composite_share >= 0.5
+    ):
+        return {
+            "label": "title_block",
+            "confidence": 0.65,
+            "reasons": ["thin_edge_hugging_lines"],
+        }
+    # Default: view. Score reflects how confident we are this is a real
+    # candidate region for one of the 4 target classes (SMD, Substrate,
+    # Die area, Alignment mark) — circle/pad density and repetition help.
+    reasons = []
+    confidence = 0.55
+    if circle_share >= REGION_CIRCLE_RATIO_VIEW:
+        reasons.append("circle_pad_density")
+        confidence = max(confidence, 0.8)
+    if repetition < 0.6:
+        reasons.append("low_size_entropy_repetition")
+        confidence = max(confidence, 0.72)
+    if composite_share >= 0.3 and circle_share < 0.02:
+        reasons.append("substrate_or_outline_lines")
+        confidence = max(confidence, 0.6)
+    if not reasons:
+        reasons.append("default_view")
+    return {"label": "view", "confidence": round(confidence, 3), "reasons": reasons}
+
+
+def _classify_regions_heuristic(regions_with_features):
+    classified = []
+    for region in regions_with_features:
+        verdict = _classify_region_heuristic(region["features"])
+        merged = dict(region)
+        merged["label"] = verdict["label"]
+        merged["label_confidence"] = verdict["confidence"]
+        merged["label_reasons"] = verdict["reasons"]
+        merged["label_source"] = "heuristic"
+        merged["included_in_pipeline"] = verdict["label"] in REGION_PIPELINE_LABELS
+        classified.append(merged)
+    return classified
+
+
+def _format_target_class_block(target_classes, target_descriptions):
+    """Render the user's target classes + descriptions for prompt injection."""
+    target_classes = list(target_classes or [])
+    desc_map = target_descriptions if isinstance(target_descriptions, dict) else {}
+    if not target_classes and not desc_map:
+        return "(user did not specify target classes; treat any candidate region as a view)"
+    lines = []
+    seen = set()
+    for cls in target_classes:
+        seen.add(cls)
+        desc = (desc_map.get(cls) or "").strip()
+        lines.append(f"  - {cls}" + (f": {desc}" if desc else ""))
+    for cls, desc in desc_map.items():
+        if cls in seen:
+            continue
+        desc = (desc or "").strip()
+        lines.append(f"  - {cls}" + (f": {desc}" if desc else ""))
+    return "\n".join(lines)
+
+
+def _agent_region_classifier_prompt(
+    regions, instruction, target_classes, target_descriptions=None
+):
+    summary = [
+        {
+            "id": r["id"],
+            "roi_pct": r["roi_pct"],
+            "heuristic_label": r["label"],
+            "heuristic_confidence": r["label_confidence"],
+            "features": r["features"],
+        }
+        for r in regions
+    ]
+    target_block = _format_target_class_block(target_classes, target_descriptions)
+    return (
+        "You refine region labels for a CAD drawing region map.\n"
+        "The user wants to extract these target classes (descriptions provided):\n"
+        f"{target_block}\n"
+        "A 'view' is any region likely to contain instances of those targets.\n"
+        "Each region has a render-pct bbox in [0,1] and numeric features.\n"
+        "Allowed labels: view, detail, table, title_block, dimension, note, unknown.\n"
+        "DEFAULT to 'view' unless the region clearly is a non-view artifact:\n"
+        "  - 'table': only if text_share is high AND structural lines form a grid;\n"
+        "             not every drawing has a table — do not invent one\n"
+        "  - 'title_block': thin strip hugging a drawing edge, mostly lines\n"
+        "  - 'dimension': dimension/leader dominated OR a thin strip with no targets\n"
+        "  - 'note': small text-heavy region NOT in a grid\n"
+        "  - 'detail': a zoomed callout, usually labelled\n"
+        "When in doubt label 'view' — false negatives lose target candidates.\n"
+        "Return strict JSON without markdown.\n"
+        "Schema:\n"
+        '{"regions":[{"id":"region_00","label":"view","name":"top_view",'
+        '"confidence":0.0,"reasons":["..."]}]}\n'
+        f"User instruction: {instruction or ''}\n"
+        f"Regions: {json.dumps(summary)}\n"
+    )
+
+
+def _classify_regions_llm(
+    regions_with_features,
+    *,
+    instruction,
+    target_classes,
+    target_descriptions=None,
+    provider,
+    raise_on_error=False,
+):
+    """Optionally refine heuristic labels with an LLM. Defaults to silent fallback;
+    pass raise_on_error=True to propagate provider errors (used by /agent/propose).
+
+    Region classification is text-only — uses llm_model only, never vlm_model
+    (vision waste for numeric features)."""
+    if not regions_with_features:
+        return regions_with_features
+    config = _vllm_config(provider)
+    model = config["llm_model"]
+    if not config["enabled"] or not model:
+        return regions_with_features
+    prompt = _agent_region_classifier_prompt(
+        regions_with_features,
+        instruction,
+        target_classes,
+        target_descriptions=target_descriptions,
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": "You return strict JSON for CAD region classification.",
+        },
+        {"role": "user", "content": prompt},
+    ]
+    try:
+        raw = _vllm_chat_completion_with_retry(model, messages, provider=provider)
+    except RuntimeError:
+        if raise_on_error:
+            raise
+        return regions_with_features
+    parsed = _extract_json_object(raw)
+    if not isinstance(parsed, dict):
+        return regions_with_features
+    overrides = {}
+    for item in parsed.get("regions") or []:
+        if isinstance(item, dict) and item.get("id"):
+            overrides[item["id"]] = item
+
+    refined = []
+    for region in regions_with_features:
+        merged = dict(region)
+        ov = overrides.get(region["id"])
+        if isinstance(ov, dict):
+            label = str(ov.get("label") or merged["label"]).strip().lower()
+            if label in REGION_LABELS:
+                merged["label"] = label
+            try:
+                merged["label_confidence"] = round(
+                    _clamp01(float(ov.get("confidence"))), 3
+                )
+            except (TypeError, ValueError):
+                pass
+            reasons = ov.get("reasons")
+            if isinstance(reasons, list):
+                merged["label_reasons"] = [str(x) for x in reasons[:5]]
+            name = ov.get("name")
+            if isinstance(name, str) and name.strip():
+                merged["view_name"] = name.strip()
+            merged["label_source"] = "llm"
+        merged["included_in_pipeline"] = merged["label"] in REGION_PIPELINE_LABELS
+        refined.append(merged)
+    return refined
+
+
+def _detect_regions(
+    cache_payload,
+    *,
+    instruction=None,
+    target_classes=None,
+    target_descriptions=None,
+    provider=None,
+    settings=None,
+    raise_on_llm_error=False,
+):
+    """Run density grid -> components -> features -> heuristic -> optional LLM refine."""
+    settings = settings or {}
+    grid_size = int(settings.get("view_grid_size") or VIEW_GRID_SIZE_DEFAULT)
+    min_cells = int(
+        settings.get("view_min_region_cells") or VIEW_MIN_REGION_CELLS_DEFAULT
+    )
+    close_kernel = int(settings.get("view_close_kernel", VIEW_CLOSE_KERNEL_DEFAULT))
+    connectivity = int(
+        settings.get("view_connectivity") or VIEW_CONNECTIVITY_DEFAULT
+    )
+    density_quantile = float(
+        settings.get("view_density_quantile", VIEW_DENSITY_QUANTILE_DEFAULT)
+    )
+    density = _compute_density_grid(cache_payload, gx=grid_size, gy=grid_size)
+    raw_regions = _label_connected_regions(
+        density,
+        min_cells=min_cells,
+        close_kernel=close_kernel,
+        connectivity=connectivity,
+        density_quantile=density_quantile,
+    )
+    enriched = []
+    for region in raw_regions:
+        features = _region_features(cache_payload, region)
+        enriched.append(
+            {
+                "id": region["id"],
+                "roi_pct": region["roi_pct"],
+                "grid_bbox": region["grid_bbox"],
+                "cell_count": region["cell_count"],
+                "entity_count": region["entity_count"],
+                "features": features,
+            }
+        )
+    classified = _classify_regions_heuristic(enriched)
+    refined = _classify_regions_llm(
+        classified,
+        instruction=instruction or "",
+        target_classes=target_classes or [],
+        target_descriptions=target_descriptions or {},
+        provider=provider,
+        raise_on_error=raise_on_llm_error,
+    )
+    view_idx = 0
+    for region in refined:
+        if region["label"] in REGION_PIPELINE_LABELS and not region.get("view_name"):
+            view_idx += 1
+            region["view_name"] = f"view_{view_idx:02d}"
+    return refined, density
+
+
+# --- Tile rendering for VLM seed proposal ---
+
+TILE_PX_LONG_SIDE_DEFAULT = 768
+TILE_GRID_PER_VIEW_DEFAULT = 3
+SEED_DEDUP_DIST_PCT_DEFAULT = 0.01
+
+
+def _render_tile_png(
+    cache_payload,
+    roi_pct,
+    *,
+    px_long_side=TILE_PX_LONG_SIDE_DEFAULT,
+    line_width=0.6,
+    dpi=100,
+):
+    """Render fingerprint geometry inside roi_pct to PNG bytes (lazy matplotlib)."""
+    import matplotlib
+
+    matplotlib.use("Agg", force=False)
+    import matplotlib.pyplot as plt
+    import io as _io
+
+    bounds = cache_payload["bounds"]
+    fingerprints = cache_payload.get("fingerprints") or []
+    (x0p, y0p), (x1p, y1p) = roi_pct
+    width = float(bounds["width"])
+    height = float(bounds["height"])
+    dxf_min_x = bounds["min_x"] + x0p * width
+    dxf_max_x = bounds["min_x"] + x1p * width
+    dxf_max_y = bounds["max_y"] - y0p * height
+    dxf_min_y = bounds["max_y"] - y1p * height
+    tile_w = max(dxf_max_x - dxf_min_x, BOUNDS_EPS)
+    tile_h = max(dxf_max_y - dxf_min_y, BOUNDS_EPS)
+    aspect = tile_w / tile_h
+    if aspect >= 1:
+        fig_w_px = int(px_long_side)
+        fig_h_px = max(64, int(round(px_long_side / aspect)))
+    else:
+        fig_h_px = int(px_long_side)
+        fig_w_px = max(64, int(round(px_long_side * aspect)))
+
+    fig = plt.figure(figsize=(fig_w_px / dpi, fig_h_px / dpi), dpi=dpi)
+    fig.patch.set_facecolor("white")
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.set_xlim(dxf_min_x, dxf_max_x)
+    ax.set_ylim(dxf_min_y, dxf_max_y)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.set_facecolor("white")
+
+    margin_x = tile_w * 1e-3
+    margin_y = tile_h * 1e-3
+    for f in fingerprints:
+        cx = float(f.get("x", 0.0))
+        cy = float(f.get("y", 0.0))
+        if not (
+            dxf_min_x - margin_x <= cx <= dxf_max_x + margin_x
+            and dxf_min_y - margin_y <= cy <= dxf_max_y + margin_y
+        ):
+            continue
+        geom = f.get("geometry") or {}
+        kind = geom.get("kind")
+        if kind == "circle":
+            ax.add_patch(
+                plt.Circle(
+                    (geom.get("cx", cx), geom.get("cy", cy)),
+                    float(geom.get("r", f.get("size", 0.0))),
+                    fill=False,
+                    linewidth=line_width,
+                    edgecolor="black",
+                )
+            )
+        elif kind == "polyline":
+            pts = geom.get("points") or []
+            if len(pts) >= 2:
+                xs = [p[0] for p in pts]
+                ys = [p[1] for p in pts]
+                ax.plot(xs, ys, linewidth=line_width, color="black")
+    buf = _io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, pad_inches=0)
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def _iter_tiles_for_view(roi_pct, *, grid_x=TILE_GRID_PER_VIEW_DEFAULT, grid_y=None):
+    """Yield (tile_index, tile_roi_pct, local_origin_pct, local_size_pct).
+
+    local_origin_pct/local_size_pct describe the tile bbox within the parent ROI,
+    so VLM-returned tile-local coords can be mapped back to full-render pct.
+    """
+    if grid_y is None:
+        grid_y = grid_x
+    grid_x = max(1, int(grid_x))
+    grid_y = max(1, int(grid_y))
+    (x0, y0), (x1, y1) = roi_pct
+    rw = x1 - x0
+    rh = y1 - y0
+    tw = rw / grid_x
+    th = rh / grid_y
+    idx = 0
+    for iy in range(grid_y):
+        for ix in range(grid_x):
+            tx0 = x0 + ix * tw
+            ty0 = y0 + iy * th
+            tx1 = tx0 + tw
+            ty1 = ty0 + th
+            yield idx, [[tx0, ty0], [tx1, ty1]], (tx0, ty0), (tw, th)
+            idx += 1
+
+
+def _tile_local_to_full_pct(local_xy, tile_origin, tile_size):
+    """Map [u, v] in tile-local pct ([0,1]) back to full-render pct."""
+    return [
+        _clamp01(tile_origin[0] + local_xy[0] * tile_size[0]),
+        _clamp01(tile_origin[1] + local_xy[1] * tile_size[1]),
+    ]
+
+
+def _agent_seed_tile_prompt(
+    *,
+    instruction,
+    target_classes,
+    target_descriptions=None,
+    view_name,
+    tile_index,
+):
+    target_block = _format_target_class_block(target_classes, target_descriptions)
+    return (
+        "You are looking at a tile cropped from a CAD drawing.\n"
+        "The tile is rendered in greyscale; black strokes are CAD geometry.\n"
+        "The user wants to find these target classes (descriptions provided):\n"
+        f"{target_block}\n"
+        "For each target you SEE in this tile, propose ONE seed candidate.\n"
+        "Coordinates you return MUST be tile-local render percentages in [0,1].\n"
+        "(0,0) is the top-left of THIS tile. Do not use full-drawing coords.\n"
+        "Use polygon_pct for repeated multi-entity footprints (3+ points).\n"
+        "Use click_pct for a single small element such as one pad.\n"
+        "If the tile contains no clear instance of any target class, return seeds: [].\n"
+        "Return only JSON, no markdown.\n"
+        "Schema:\n"
+        '{"seeds":[{"target_class":"<one of the user target classes>",'
+        '"label":"...","polygon_pct":[[x,y],[x,y],[x,y]],'
+        '"click_pct":[x,y],"confidence":0.0}],"notes":["..."]}\n'
+        f"Tile view: {view_name} (tile #{tile_index})\n"
+        f"User instruction: {instruction or ''}\n"
+    )
+
+
+def _normalize_tile_seeds(parsed, *, tile_origin, tile_size, view_name, tile_index):
+    if not isinstance(parsed, dict):
+        return []
+    seeds = []
+    for item in parsed.get("seeds") or []:
+        if not isinstance(item, dict):
+            continue
+        target_class = str(item.get("target_class") or "SMD").strip() or "SMD"
+        confidence = item.get("confidence")
+        try:
+            confidence = round(_clamp01(float(confidence)), 3) if confidence is not None else None
+        except (TypeError, ValueError):
+            confidence = None
+        seed = {
+            "target_class": target_class,
+            "view_name": view_name,
+            "label": str(item.get("label") or "").strip() or None,
+            "confidence": confidence,
+            "source": "vlm_tile",
+            "tile_index": tile_index,
+        }
+        click_local = _clamp_pct_pair(item.get("click_pct"))
+        if click_local:
+            seed["click_pct"] = _tile_local_to_full_pct(
+                click_local, tile_origin, tile_size
+            )
+        polygon_local = item.get("polygon_pct")
+        if isinstance(polygon_local, list) and len(polygon_local) >= 3:
+            pts = [_clamp_pct_pair(p) for p in polygon_local]
+            pts = [p for p in pts if p]
+            if len(pts) >= 3:
+                seed["polygon_pct"] = [
+                    _tile_local_to_full_pct(p, tile_origin, tile_size) for p in pts
+                ]
+        if seed.get("click_pct") or seed.get("polygon_pct"):
+            seeds.append(seed)
+    return seeds
+
+
+def _seed_centroid_pct(seed):
+    if seed.get("click_pct"):
+        return tuple(seed["click_pct"])
+    poly = seed.get("polygon_pct") or []
+    if poly:
+        return (
+            sum(p[0] for p in poly) / len(poly),
+            sum(p[1] for p in poly) / len(poly),
+        )
+    return None
+
+
+def _dedup_seeds_by_geometry(seeds, *, dist_threshold=SEED_DEDUP_DIST_PCT_DEFAULT):
+    """Greedy spatial dedup: drop seeds whose centroid is within dist_threshold
+    pct of an already-kept seed of the same target_class."""
+    kept = []
+    for seed in sorted(
+        seeds,
+        key=lambda s: -(s.get("confidence") if s.get("confidence") is not None else 0.0),
+    ):
+        c = _seed_centroid_pct(seed)
+        if c is None:
+            continue
+        duplicate = False
+        for prior in kept:
+            if prior.get("target_class") != seed.get("target_class"):
+                continue
+            pc = _seed_centroid_pct(prior)
+            if pc is None:
+                continue
+            if math.hypot(c[0] - pc[0], c[1] - pc[1]) <= dist_threshold:
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append(seed)
+    return kept
+
+
+def _propose_seeds_for_region(
+    cache_payload,
+    region,
+    *,
+    instruction,
+    target_classes,
+    target_descriptions=None,
+    provider,
+    settings,
+):
+    """Tile a view region, render each tile, ask VLM for seeds, merge and dedup.
+
+    Returns (seeds, tile_debug, errors). Empty seeds is fine; errors lists
+    per-tile failures so the caller can decide whether to surface 502.
+    """
+    config = _vllm_config(provider)
+    vlm_model = config["vlm_model"]
+    if not config["enabled"] or not vlm_model:
+        return [], [], []
+    grid = int(
+        settings.get("tile_grid_per_view") or TILE_GRID_PER_VIEW_DEFAULT
+    )
+    px_long = int(
+        settings.get("tile_px_long_side") or TILE_PX_LONG_SIDE_DEFAULT
+    )
+    dedup_dist = float(
+        settings.get("seed_dedup_dist_pct") or SEED_DEDUP_DIST_PCT_DEFAULT
+    )
+    view_name = region.get("view_name") or region.get("id")
+    seeds = []
+    tile_debug = []
+    errors = []
+    for tile_idx, tile_roi, tile_origin, tile_size in _iter_tiles_for_view(
+        region["roi_pct"], grid_x=grid
+    ):
+        png_bytes = _render_tile_png(
+            cache_payload, tile_roi, px_long_side=px_long
+        )
+        import base64 as _base64
+
+        data_url = "data:image/png;base64," + _base64.b64encode(png_bytes).decode(
+            "ascii"
+        )
+        prompt = _agent_seed_tile_prompt(
+            instruction=instruction,
+            target_classes=target_classes,
+            target_descriptions=target_descriptions,
+            view_name=view_name,
+            tile_index=tile_idx,
+        )
+        messages = [
+            {
+                "role": "system",
+                "content": "You return strict JSON for CAD tile seed proposals.",
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            },
+        ]
+        try:
+            raw, used_text_only = _vllm_chat_completion_with_image_fallback(
+                vlm_model, messages, provider=provider
+            )
+        except RuntimeError as exc:
+            errors.append(
+                {
+                    "view_name": view_name,
+                    "tile_index": tile_idx,
+                    "error": str(exc),
+                }
+            )
+            tile_debug.append(
+                {
+                    "view_name": view_name,
+                    "tile_index": tile_idx,
+                    "tile_roi_pct": tile_roi,
+                    "status": "error",
+                    "error": str(exc),
+                }
+            )
+            continue
+        parsed = _extract_json_object(raw)
+        tile_seeds = _normalize_tile_seeds(
+            parsed,
+            tile_origin=tile_origin,
+            tile_size=tile_size,
+            view_name=view_name,
+            tile_index=tile_idx,
+        )
+        if used_text_only:
+            for seed in tile_seeds:
+                seed["source"] = "llm_tile_text_only"
+                if seed.get("confidence") is not None:
+                    seed["confidence"] = round(min(seed["confidence"], 0.3), 3)
+                else:
+                    seed["confidence"] = 0.2
+        seeds.extend(tile_seeds)
+        tile_debug.append(
+            {
+                "view_name": view_name,
+                "tile_index": tile_idx,
+                "tile_roi_pct": tile_roi,
+                "status": "ok_text_only" if used_text_only else "ok",
+                "seed_count": len(tile_seeds),
+            }
+        )
+    return _dedup_seeds_by_geometry(seeds, dist_threshold=dedup_dist), tile_debug, errors
+
+
+def _default_agent_views():
+    return [
+        {
+            "name": "full_drawing",
+            "roi_pct": [[0.0, 0.0], [1.0, 1.0]],
+            "confidence": 0.0,
+            "source": "fallback",
+            "needs_review": True,
+        }
+    ]
+
+
+def _normalize_agent_views(view_models):
+    views = []
+    for view in view_models or []:
+        roi_pct = _normalize_roi_pct(view.roi_pct)
+        views.append(
+            {
+                "name": view.name,
+                "roi_pct": roi_pct,
+                "confidence": view.confidence,
+                "source": view.source or "request",
+                "needs_review": roi_pct is None,
+            }
+        )
+    return views or _default_agent_views()
+
+
+def _agent_view_by_name(views):
+    return {view["name"]: view for view in views if view.get("name")}
+
+
+def _agent_seed_payload(seed):
+    return {
+        "target_class": seed.target_class,
+        "view_name": seed.view_name,
+        "label": seed.label,
+        "template_id": seed.template_id,
+        "entity_count": len(seed.entities or []),
+        "group_center": seed.group_center,
+        "click_pct": seed.click_pct,
+        "polygon_pct": seed.polygon_pct,
+        "confidence": seed.confidence,
+        "source": seed.source or "request",
+    }
+
+
+def _agent_validation_summary(extract_result, scan_result, seed_confidence=None):
+    entity_count = int((extract_result or {}).get("entity_count") or 0)
+    match_count = int((scan_result or {}).get("match_count") or 0)
+    scan_stats = (scan_result or {}).get("scan_stats") or {}
+    score_max = scan_stats.get("score_max")
+    scores = [
+        m.get("match_score")
+        for m in (scan_result or {}).get("matches", [])
+        if m.get("match_score") is not None
+    ]
+    mean_score = round(float(sum(scores) / len(scores)), 6) if scores else None
+    warnings = []
+    if entity_count <= 0:
+        warnings.append("seed_extracted_no_entities")
+    if match_count <= 0:
+        warnings.append("scan_found_no_matches")
+    if match_count > 1000:
+        warnings.append("scan_found_many_matches")
+    if seed_confidence is not None and seed_confidence < 0.5:
+        warnings.append("low_seed_confidence")
+    confidence_parts = []
+    if seed_confidence is not None:
+        confidence_parts.append(max(0.0, min(float(seed_confidence), 1.0)))
+    if entity_count > 0:
+        confidence_parts.append(0.75)
+    if match_count > 0:
+        confidence_parts.append(0.8)
+    if warnings:
+        confidence_parts.append(0.45)
+    confidence = (
+        round(sum(confidence_parts) / len(confidence_parts), 3)
+        if confidence_parts
+        else 0.0
+    )
+    return {
+        "confidence": confidence,
+        "warnings": warnings,
+        "entity_count": entity_count,
+        "match_count": match_count,
+        "mean_match_score": mean_score,
+        "score_max": score_max,
+    }
+
+
+def _group_agent_results(class_results):
+    grouped = {}
+    for result in class_results:
+        target_class = result.get("target_class") or "Uncategorized"
+        view_name = result.get("view_name") or "unassigned_view"
+        grouped.setdefault(target_class, {}).setdefault(view_name, []).append(result)
+    return grouped
+
+
+def _json_response_payload(response):
+    if not isinstance(response, JSONResponse):
+        return response
+    try:
+        return json.loads(response.body.decode("utf-8"))
+    except Exception:
+        return {"error": "Unable to decode JSON response."}
+
+
+def _provider_value(provider, attr, env_name, default=""):
+    if provider is not None:
+        value = getattr(provider, attr, None)
+        if value is not None:
+            return value
+    return os.environ.get(env_name) or default
+
+
+def _vllm_config(provider=None):
+    base_url = str(
+        _provider_value(provider, "base_url", "VLLM_BASE_URL", "")
+    ).strip().rstrip("/")
+    llm_model = str(
+        _provider_value(provider, "llm_model", "VLLM_LLM_MODEL", "")
+    ).strip()
+    vlm_model = str(
+        _provider_value(provider, "vlm_model", "VLLM_VLM_MODEL", "")
+    ).strip()
+    api_key = str(_provider_value(provider, "api_key", "VLLM_API_KEY", "")).strip()
+    timeout_default = 30 if provider is not None else 60
+    timeout_raw = _provider_value(
+        provider, "timeout_seconds", "VLLM_TIMEOUT_SECONDS", timeout_default
+    )
+    try:
+        timeout_seconds = float(timeout_raw)
+    except (TypeError, ValueError):
+        timeout_seconds = 60.0
+    temperature_raw = _provider_value(provider, "temperature", "VLLM_TEMPERATURE", 0)
+    try:
+        temperature = float(temperature_raw)
+    except (TypeError, ValueError):
+        temperature = 0.0
+    max_tokens_raw = _provider_value(provider, "max_tokens", "VLLM_MAX_TOKENS", 1200)
+    try:
+        max_tokens = int(max_tokens_raw)
+    except (TypeError, ValueError):
+        max_tokens = 1200
+    max_tokens = max(128, min(max_tokens, 8192))
+    return {
+        "base_url": base_url,
+        "api_key": api_key,
+        "api_key_configured": bool(api_key),
+        "llm_model": llm_model,
+        "vlm_model": vlm_model,
+        "timeout_seconds": timeout_seconds,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "send_image": bool(provider and provider.send_image),
+        "enabled": bool(base_url and (vlm_model or llm_model)),
+        "source": "request" if provider and provider.base_url else "environment",
+    }
+
+
+def _vllm_chat_url(base_url):
+    if base_url.endswith("/chat/completions"):
+        return base_url
+    if base_url.endswith("/v1"):
+        return base_url + "/chat/completions"
+    return base_url + "/v1/chat/completions"
+
+
+def _extract_json_object(text):
+    if not text:
+        return None
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        stripped = "\n".join(lines).strip()
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        return json.loads(stripped[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+
+
+def _vllm_chat_completion(model, messages, *, temperature=0.0, provider=None):
+    config = _vllm_config(provider)
+    if not config["base_url"] or not model:
+        raise RuntimeError("vLLM is not configured.")
+    body = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": config["max_tokens"],
+    }
+    headers = {"Content-Type": "application/json"}
+    api_key = config["api_key"]
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(
+        _vllm_chat_url(config["base_url"]),
+        data=json.dumps(body).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=config["timeout_seconds"]) as res:
+            payload = json.loads(res.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"vLLM HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"vLLM connection failed: {exc}") from exc
+    except (TimeoutError, socket.timeout) as exc:
+        raise RuntimeError(
+            f"Provider request timed out after {config['timeout_seconds']} seconds."
+        ) from exc
+    choices = payload.get("choices") or []
+    if not choices:
+        raise RuntimeError("vLLM response did not include choices.")
+    return ((choices[0].get("message") or {}).get("content") or "").strip()
+
+
+def _vllm_chat_completion_with_retry(model, messages, *, provider=None):
+    config = _vllm_config(provider)
+    try:
+        return _vllm_chat_completion(
+            model, messages, temperature=config["temperature"], provider=provider
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+        if (
+            "invalid temperature" in message.lower()
+            and "only 1 is allowed" in message.lower()
+            and not math.isclose(config["temperature"], 1.0)
+        ):
+            return _vllm_chat_completion(
+                model, messages, temperature=1.0, provider=provider
+            )
+        raise
+
+
+def _messages_without_image_inputs(messages):
+    stripped = []
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list):
+            text_parts = [
+                part.get("text", "")
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            ]
+            new_message = dict(message)
+            new_message["content"] = "\n".join(text_parts).strip()
+            stripped.append(new_message)
+        else:
+            stripped.append(message)
+    return stripped
+
+
+_IMAGE_REJECTION_HINTS = (
+    "unsupported image format",
+    "invalid image",
+    "image format",
+    "image_url",
+    "image url",
+    "vision",
+    "multimodal",
+    "non-text",
+    "content type",
+    "model does not support",
+    "does not support image",
+    "no support for image",
+    "cannot process image",
+    "image input",
+)
+
+
+def _looks_like_image_rejection(message):
+    return any(hint in message for hint in _IMAGE_REJECTION_HINTS)
+
+
+def _vllm_chat_completion_with_image_fallback(model, messages, *, provider=None):
+    """Call provider; if it rejects image input, transparently retry text-only.
+
+    Returns (content, used_text_only_fallback) so callers can flag the result."""
+    try:
+        return _vllm_chat_completion_with_retry(model, messages, provider=provider), False
+    except RuntimeError as exc:
+        message = str(exc).lower()
+        has_image = any(
+            isinstance(msg.get("content"), list)
+            and any(
+                isinstance(part, dict) and part.get("type") == "image_url"
+                for part in msg.get("content")
+            )
+            for msg in messages
+        )
+        if has_image and _looks_like_image_rejection(message):
+            content = _vllm_chat_completion_with_retry(
+                model, _messages_without_image_inputs(messages), provider=provider
+            )
+            return content, True
+        raise
+
+
+def _provider_public_debug(config):
+    return {
+        "base_url": config["base_url"],
+        "source": config["source"],
+        "api_key_configured": config["api_key_configured"],
+        "llm_model": config["llm_model"] or None,
+        "vlm_model": config["vlm_model"] or None,
+        "timeout_seconds": config["timeout_seconds"],
+        "temperature": config["temperature"],
+        "max_tokens": config["max_tokens"],
+        "send_image": config["send_image"],
+    }
+
+
+def _is_supported_agent_image_data_url(value):
+    if not isinstance(value, str):
+        return False
+    prefix = value.split(",", 1)[0].lower()
+    return prefix.startswith("data:image/jpeg;base64") or prefix.startswith(
+        "data:image/png;base64"
+    )
+
+
+def _agent_proposal_prompt(request, cache_payload):
+    target_classes = request.target_classes or ["SMD"]
+    existing_views = [
+        {
+            "name": view.name,
+            "roi_pct": view.roi_pct,
+            "confidence": view.confidence,
+            "source": view.source,
+        }
+        for view in request.views
+    ]
+    return (
+        "You are proposing CAD matching review inputs for a semiconductor package drawing.\n"
+        "Return only a JSON object. Do not include markdown.\n"
+        "Coordinates must be render percentage coordinates in [0, 1], not pixels.\n"
+        "Detect the two main package views when visible: top_view and bottom_view.\n"
+        "For each requested target class, propose one or more seed candidates inside a view.\n"
+        "Prefer polygon_pct for multi-entity footprints and click_pct for a single obvious entity.\n"
+        "If uncertain, still return the best candidates with lower confidence and notes.\n"
+        "Schema:\n"
+        "{"
+        "\"views\":[{\"name\":\"top_view\",\"roi_pct\":[[x1,y1],[x2,y2]],\"confidence\":0.0,\"source\":\"vlm\"}],"
+        "\"seed_candidates\":[{\"target_class\":\"SMD\",\"view_name\":\"top_view\",\"label\":\"...\","
+        "\"polygon_pct\":[[x,y],[x,y],[x,y]],\"click_pct\":[x,y],\"confidence\":0.0,\"source\":\"vlm\"}],"
+        "\"notes\":[\"...\"]"
+        "}\n"
+        f"User instruction: {request.instruction}\n"
+        f"Target classes: {target_classes}\n"
+        f"Existing human/model views: {existing_views}\n"
+        f"Drawing bounds: {cache_payload.get('bounds')}\n"
+    )
+
+
+def _normalize_agent_proposal(raw):
+    data = raw if isinstance(raw, dict) else {}
+    views = []
+    for item in data.get("views") or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        roi_pct = _normalize_roi_pct(item.get("roi_pct"))
+        if not name or not roi_pct:
+            continue
+        views.append(
+            {
+                "name": name,
+                "roi_pct": roi_pct,
+                "confidence": item.get("confidence"),
+                "source": item.get("source") or "vlm",
+                "needs_review": True,
+            }
+        )
+    seeds = []
+    for item in data.get("seed_candidates") or []:
+        if not isinstance(item, dict):
+            continue
+        seed = {
+            "target_class": str(item.get("target_class") or "SMD"),
+            "view_name": item.get("view_name"),
+            "label": item.get("label"),
+            "confidence": item.get("confidence"),
+            "source": item.get("source") or "vlm",
+        }
+        click_pct = _clamp_pct_pair(item.get("click_pct"))
+        polygon_pct = item.get("polygon_pct")
+        if click_pct:
+            seed["click_pct"] = click_pct
+        if isinstance(polygon_pct, list) and len(polygon_pct) >= 3:
+            pts = [_clamp_pct_pair(pt) for pt in polygon_pct]
+            pts = [pt for pt in pts if pt]
+            if len(pts) >= 3:
+                seed["polygon_pct"] = pts
+        if seed.get("click_pct") or seed.get("polygon_pct"):
+            seeds.append(seed)
+    return {
+        "views": views,
+        "seed_candidates": seeds,
+        "notes": data.get("notes") if isinstance(data.get("notes"), list) else [],
+    }
+
+
 def _entity_basic_match(
     template_entity,
     candidate_feature,
@@ -2439,6 +3813,540 @@ async def get_settings_schema():
             for meta in SINGLE_ENTITY_MATCH_PLUGINS.values()
         ],
         "hyperparameters": HYPERPARAMETER_SCHEMA,
+    }
+
+
+@app.get("/agent/schema")
+async def get_agent_schema():
+    return {
+        "status": "experimental",
+        "vllm": {
+            "env": [
+                "VLLM_BASE_URL",
+                "VLLM_VLM_MODEL",
+                "VLLM_LLM_MODEL",
+                "VLLM_API_KEY",
+                "VLLM_TIMEOUT_SECONDS",
+                "VLLM_TEMPERATURE",
+            ],
+            "request_provider": {
+                "base_url": "OpenAI-compatible base URL, e.g. https://api.moonshot.ai",
+                "api_key": "Optional bearer token.",
+                "llm_model": "Text model for JSON proposals.",
+                "vlm_model": "Vision model for SVG/image proposals.",
+                "timeout_seconds": 60,
+                "temperature": "Defaults to 0. Some providers/models require 1.",
+                "max_tokens": 1200,
+                "send_image": "Defaults to false. When true, the frontend sends a viewer-sized JPG/PNG screenshot.",
+            },
+            "openai_compatible_endpoint": "/v1/chat/completions",
+        },
+        "target_classes": "Free-form list chosen by the user; common chip examples: SMD, Substrate, Die area, Alignment mark.",
+        "target_descriptions": "Optional dict mapping each target class name to a free-form description fed into LLM/VLM prompts.",
+        "request": {
+            "cache_id": "Upload cache id returned by /upload.",
+            "instruction": "Natural-language extraction goal.",
+            "target_classes": ["SMD"],
+            "target_descriptions": {
+                "SMD": "small repeated circular pads arranged in arrays",
+            },
+            "views": [
+                {
+                    "name": "top_view",
+                    "roi_pct": [[0.08, 0.12], [0.48, 0.82]],
+                    "confidence": 0.8,
+                    "source": "vlm",
+                }
+            ],
+            "seed_candidates": [
+                {
+                    "target_class": "SMD",
+                    "view_name": "top_view",
+                    "template_id": "optional-existing-template-id",
+                    "polygon_pct": [[0.1, 0.1], [0.12, 0.1], [0.12, 0.12]],
+                    "confidence": 0.72,
+                    "source": "vlm",
+                }
+            ],
+            "plugins": ["composite_shape_signature"],
+            "settings": {"score_max": 0.4},
+        },
+        "notes": [
+            "When seed_candidates is empty, /agent/run returns a review payload for ROI and seed selection.",
+            "Seed candidates may reference an existing template_id, inline entities/group_center, click_pct, or polygon_pct.",
+            "When seed_candidates is present, /agent/run resolves each seed and scans with /scan_fast.",
+            "The model should output coordinates in render percentage space, not screen pixels.",
+        ],
+    }
+
+
+@app.get("/agent/config")
+async def get_agent_config():
+    config = _vllm_config()
+    return {
+        "vllm_enabled": config["enabled"],
+        "base_url_configured": bool(config["base_url"]),
+        "api_key_configured": config["api_key_configured"],
+        "llm_model": config["llm_model"] or None,
+        "vlm_model": config["vlm_model"] or None,
+        "timeout_seconds": config["timeout_seconds"],
+        "temperature": config["temperature"],
+        "max_tokens": config["max_tokens"],
+        "send_image": config["send_image"],
+        "source": config["source"],
+    }
+
+
+@app.get("/agent/render/{cache_id}")
+async def get_agent_render(
+    cache_id: str,
+    include_svg: bool = Query(False),
+):
+    cache_payload = _get_cache(cache_id)
+    if cache_payload is None:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "Invalid or expired cache_id. Please upload a file again."
+            },
+        )
+    svg = cache_payload.get("svg") or ""
+    payload = {
+        "cache_id": cache_id,
+        "bounds": cache_payload.get("bounds"),
+        "entity_count": len(cache_payload.get("fingerprints") or []),
+        "has_svg": bool(svg),
+        "svg_length": len(svg),
+        "coord_basis": (
+            "render_matrix" if cache_payload.get("render_mapping") else "dxf_extents"
+        ),
+    }
+    if include_svg:
+        payload["svg"] = svg
+    return payload
+
+
+@app.get("/agent/regions/{cache_id}")
+async def get_agent_regions(
+    cache_id: str,
+    grid_size: int = Query(VIEW_GRID_SIZE_DEFAULT),
+    min_region_cells: int = Query(VIEW_MIN_REGION_CELLS_DEFAULT),
+    close_kernel: int = Query(VIEW_CLOSE_KERNEL_DEFAULT),
+    connectivity: int = Query(VIEW_CONNECTIVITY_DEFAULT),
+    density_quantile: float = Query(VIEW_DENSITY_QUANTILE_DEFAULT),
+    include_grid: bool = Query(False),
+):
+    cache_payload = _get_cache(cache_id)
+    if cache_payload is None:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "Invalid or expired cache_id. Please upload a file again."
+            },
+        )
+    regions, density = _detect_regions(
+        cache_payload,
+        settings={
+            "view_grid_size": grid_size,
+            "view_min_region_cells": min_region_cells,
+            "view_close_kernel": close_kernel,
+            "view_connectivity": connectivity,
+            "view_density_quantile": density_quantile,
+        },
+    )
+    payload = {
+        "cache_id": cache_id,
+        "bounds": cache_payload.get("bounds"),
+        "grid_size": density["gx"],
+        "regions": regions,
+        "summary": {
+            "total_regions": len(regions),
+            "view_regions": sum(1 for r in regions if r["label"] == "view"),
+            "table_regions": sum(1 for r in regions if r["label"] == "table"),
+            "title_block_regions": sum(
+                1 for r in regions if r["label"] == "title_block"
+            ),
+            "dimension_regions": sum(
+                1 for r in regions if r["label"] == "dimension"
+            ),
+            "entity_total": int(density["grid"].sum()),
+        },
+    }
+    if include_grid:
+        payload["density_grid"] = density["grid"].tolist()
+    return payload
+
+
+@app.get("/agent/tile/{cache_id}")
+async def get_agent_tile(
+    cache_id: str,
+    x0: float = Query(0.0),
+    y0: float = Query(0.0),
+    x1: float = Query(1.0),
+    y1: float = Query(1.0),
+    px: int = Query(TILE_PX_LONG_SIDE_DEFAULT),
+):
+    cache_payload = _get_cache(cache_id)
+    if cache_payload is None:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "Invalid or expired cache_id. Please upload a file again."
+            },
+        )
+    roi_pct = _normalize_roi_pct([[x0, y0], [x1, y1]])
+    if roi_pct is None:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Invalid tile rectangle."},
+        )
+    png_bytes = _render_tile_png(
+        cache_payload, roi_pct, px_long_side=max(64, min(int(px), 4096))
+    )
+    from fastapi.responses import Response
+
+    return Response(content=png_bytes, media_type="image/png")
+
+
+def _region_to_view(region):
+    return {
+        "name": region.get("view_name") or region["id"],
+        "roi_pct": region["roi_pct"],
+        "confidence": region.get("label_confidence"),
+        "source": region.get("label_source", "heuristic"),
+        "needs_review": True,
+        "label": region["label"],
+        "region_id": region["id"],
+    }
+
+
+@app.post("/agent/propose")
+async def propose_agent_inputs(request: AgentProposeRequest):
+    cache_payload = _get_cache(request.cache_id)
+    if cache_payload is None:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "Invalid or expired cache_id. Please upload a file again."
+            },
+        )
+    config = _vllm_config(request.provider)
+    if not config["enabled"] or not (config["llm_model"] or config["vlm_model"]):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "vLLM is not configured.",
+                "provider": _provider_public_debug(config),
+                "required": {
+                    "request_provider": [
+                        "provider.base_url",
+                        "provider.vlm_model or provider.llm_model",
+                    ],
+                    "environment": [
+                        "VLLM_BASE_URL",
+                        "VLLM_VLM_MODEL or VLLM_LLM_MODEL",
+                    ],
+                },
+                "fallback": {
+                    "status": "needs_review",
+                    "views": _normalize_agent_views(request.views),
+                    "seed_candidates": [],
+                },
+            },
+        )
+    if not cache_payload.get("svg"):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "This cache does not include an SVG render artifact."},
+        )
+
+    settings = request.settings or {}
+    notes = []
+    try:
+        regions, density = _detect_regions(
+            cache_payload,
+            instruction=request.instruction,
+            target_classes=request.target_classes,
+            target_descriptions=request.target_descriptions,
+            provider=request.provider,
+            settings=settings,
+            raise_on_llm_error=bool(config["llm_model"]),
+        )
+    except RuntimeError as exc:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": str(exc),
+                "stage": "region_classification",
+                "provider": _provider_public_debug(config),
+            },
+        )
+
+    view_regions = [r for r in regions if r["label"] in REGION_PIPELINE_LABELS]
+    views_payload = [_region_to_view(r) for r in view_regions]
+
+    seed_candidates = []
+    tile_debug = []
+    seed_errors = []
+    if config["vlm_model"] and view_regions:
+        for region in view_regions:
+            seeds, debug, errors = _propose_seeds_for_region(
+                cache_payload,
+                region,
+                instruction=request.instruction,
+                target_classes=request.target_classes or ["SMD"],
+                target_descriptions=request.target_descriptions,
+                provider=request.provider,
+                settings=settings,
+            )
+            seed_candidates.extend(seeds)
+            tile_debug.extend(debug)
+            seed_errors.extend(errors)
+        if seed_errors and not seed_candidates:
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "error": seed_errors[0]["error"],
+                    "stage": "seed_proposal",
+                    "tile_errors": seed_errors,
+                    "provider": _provider_public_debug(config),
+                },
+            )
+        if seed_errors:
+            notes.append(
+                f"{len(seed_errors)} of {len(tile_debug)} tile(s) failed seed proposal"
+            )
+    elif not config["vlm_model"]:
+        notes.append("No vlm_model configured; seed proposal skipped.")
+
+    proposal = {
+        "views": views_payload,
+        "seed_candidates": seed_candidates,
+        "regions": regions,
+        "tile_debug": tile_debug,
+        "notes": notes,
+    }
+    return {
+        "status": "proposal_ready",
+        "review_required": True,
+        "cache_id": request.cache_id,
+        "instruction": request.instruction,
+        "target_classes": request.target_classes or ["SMD"],
+        "provider": {**_provider_public_debug(config)},
+        "proposal": proposal,
+    }
+
+
+@app.post("/agent/run")
+async def run_agent_pipeline(request: AgentRunRequest):
+    cache_payload = _get_cache(request.cache_id)
+    if cache_payload is None:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "Invalid or expired cache_id. Please upload a file again."
+            },
+        )
+
+    views = _normalize_agent_views(request.views)
+    view_lookup = _agent_view_by_name(views)
+    target_classes = request.target_classes or ["SMD"]
+    runtime_config = _coerce_runtime_config(request.settings)
+    enabled_plugins = sorted(_resolve_enabled_plugins(request.plugins))
+
+    if not request.seed_candidates:
+        return {
+            "status": "needs_review",
+            "review_required": True,
+            "next_action": "confirm_view_rois_and_add_seed_candidates",
+            "cache_id": request.cache_id,
+            "instruction": request.instruction,
+            "target_classes": target_classes,
+            "views": views,
+            "class_tasks": [
+                {
+                    "target_class": target_class,
+                    "required_review": "Pick one or more representative seed templates inside each accepted view ROI.",
+                }
+                for target_class in target_classes
+            ],
+            "settings": runtime_config,
+            "plugins": enabled_plugins,
+        }
+
+    class_results = []
+    for seed in request.seed_candidates:
+        seed_payload = _agent_seed_payload(seed)
+        view = view_lookup.get(seed.view_name) if seed.view_name else None
+        roi_pct = view.get("roi_pct") if view else None
+        extract_payload = None
+        extract_result = None
+
+        if seed.template_id:
+            stored_template = _load_extracted_template(request.cache_id, seed.template_id)
+            if stored_template is None:
+                class_results.append(
+                    {
+                        "target_class": seed.target_class,
+                        "view_name": seed.view_name,
+                        "seed": seed_payload,
+                        "status": "needs_review",
+                        "error": "Seed template_id was not found in the current cache.",
+                    }
+                )
+                continue
+            extract_result = {
+                "cache_id": request.cache_id,
+                "template_id": seed.template_id,
+                "selector_mode": "template_id",
+                "group_center": stored_template.get("group_center"),
+                "entity_count": len(stored_template.get("entities", [])),
+                "entities_preview": stored_template.get("entities", [])[
+                    : int(runtime_config["extract_entities_preview_limit"])
+                ],
+                "highlights": [],
+                "highlight_labels": [],
+            }
+        elif seed.entities:
+            entities_clean = _sanitize_template_entities(seed.entities)
+            group_center = _sanitize_template_group_center(seed.group_center)
+            if group_center is None and entities_clean:
+                group_center = {
+                    "x": round(
+                        sum(entity["x"] for entity in entities_clean)
+                        / len(entities_clean),
+                        3,
+                    ),
+                    "y": round(
+                        sum(entity["y"] for entity in entities_clean)
+                        / len(entities_clean),
+                        3,
+                    ),
+                }
+            extract_result = {
+                "cache_id": request.cache_id,
+                "template_id": None,
+                "selector_mode": "inline_entities",
+                "group_center": group_center,
+                "entity_count": len(entities_clean),
+                "entities_preview": entities_clean[
+                    : int(runtime_config["extract_entities_preview_limit"])
+                ],
+                "entities": entities_clean,
+                "highlights": [],
+                "highlight_labels": [],
+            }
+        elif seed.click_pct:
+            extract_payload = {
+                "cache_id": request.cache_id,
+                "click_pct": seed.click_pct,
+                "settings": runtime_config,
+            }
+            entities_found = _extract_entities_from_click(cache_payload, seed.click_pct)
+            extract_result = _build_extract_response(
+                request.cache_id,
+                cache_payload["bounds"],
+                entities_found,
+                "click",
+                runtime_config=runtime_config,
+                render_mapping=cache_payload.get("render_mapping"),
+            )
+        elif seed.polygon_pct:
+            extract_payload = {
+                "cache_id": request.cache_id,
+                "polygon_pct": seed.polygon_pct,
+                "settings": runtime_config,
+            }
+            entities_found = _extract_entities_from_polygon(
+                cache_payload, seed.polygon_pct
+            )
+            extract_result = _build_extract_response(
+                request.cache_id,
+                cache_payload["bounds"],
+                entities_found,
+                "polygon",
+                runtime_config=runtime_config,
+                render_mapping=cache_payload.get("render_mapping"),
+            )
+        else:
+            class_results.append(
+                {
+                    "target_class": seed.target_class,
+                    "view_name": seed.view_name,
+                    "seed": seed_payload,
+                    "status": "rejected",
+                    "error": "Seed candidate must include template_id, entities, click_pct, or polygon_pct.",
+                }
+            )
+            continue
+
+        if not extract_result.get("template_id") and not extract_result.get("entities"):
+            class_results.append(
+                {
+                    "target_class": seed.target_class,
+                    "view_name": seed.view_name,
+                    "seed": seed_payload,
+                    "status": "needs_review",
+                    "extract_request": extract_payload,
+                    "extract": extract_result,
+                    "error": "Seed did not extract a usable template.",
+                }
+            )
+            continue
+
+        scan_payload = {
+            "cache_id": request.cache_id,
+            "plugins": enabled_plugins,
+            "settings": runtime_config,
+        }
+        if extract_result.get("template_id"):
+            scan_payload["template_id"] = extract_result["template_id"]
+        else:
+            scan_payload["entities"] = extract_result.get("entities", [])
+            scan_payload["group_center"] = extract_result.get("group_center")
+        if roi_pct:
+            scan_payload["roi_pct"] = roi_pct
+        scan_result = _json_response_payload(await scan_dxf_fast(scan_payload))
+        validation = _agent_validation_summary(
+            extract_result, scan_result, seed_confidence=seed.confidence
+        )
+
+        class_results.append(
+            {
+                "target_class": seed.target_class,
+                "view_name": seed.view_name,
+                "seed": seed_payload,
+                "status": "completed",
+                "requires_human_validation": True,
+                "validation": validation,
+                "extract_request": extract_payload,
+                "scan_request": {
+                    k: v
+                    for k, v in scan_payload.items()
+                    if k not in {"entities"}
+                },
+                "extract": {
+                    "template_id": extract_result.get("template_id"),
+                    "entity_count": extract_result.get("entity_count", 0),
+                    "group_center": extract_result.get("group_center"),
+                    "highlights": extract_result.get("highlights", []),
+                    "highlight_labels": extract_result.get("highlight_labels", []),
+                },
+                "scan": scan_result,
+            }
+        )
+
+    return {
+        "status": "completed_with_review",
+        "review_required": True,
+        "cache_id": request.cache_id,
+        "instruction": request.instruction,
+        "target_classes": target_classes,
+        "views": views,
+        "results": class_results,
+        "matches_by_class": _group_agent_results(class_results),
+        "settings": runtime_config,
+        "plugins": enabled_plugins,
     }
 
 
@@ -2707,6 +4615,7 @@ async def upload_dxf(
         fast_build=fast_build,
         render_mapping=render_mapping,
     )
+    cache_payload["svg"] = svg
     cache_build_time_ms = int((time.perf_counter() - t1) * 1000)
     cache_id = _store_cache(cache_payload)
     return {

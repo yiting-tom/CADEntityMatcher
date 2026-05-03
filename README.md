@@ -114,6 +114,68 @@ defaults and are not shown in the settings panel.
 
 These settings are sent to the backend and affect extract/scan behavior directly.
 
+## Agent Review MVP
+
+The experimental `Agent Review` panel supports a human-in-the-loop workflow for
+text-directed matching:
+
+1. Upload a DXF file.
+2. Enter a natural-language instruction such as `Find SMD patterns in the top and
+   bottom package views`.
+3. Click `Start Agent Review` to create a review task.
+4. Select a representative seed with the existing click or polygon selector.
+5. Click `Use Current Template as Seed`.
+6. Review the grouped agent result and highlighted matches.
+
+By default the workflow stays manual and deterministic. When a vLLM server is
+configured, the app can ask it to propose `views` and `seed_candidates`
+automatically before handing the result back to the same review loop.
+
+To enable automatic proposals, enter an OpenAI-compatible provider directly in
+the Agent Review panel:
+
+- `Provider Base URL`: for example `https://api.moonshot.ai` or a local vLLM URL
+- `Provider API Key`: optional for local vLLM, usually required for hosted APIs
+- `LLM Model`: for example `kimi-k2.6`
+- `VLM Model`: optional; if omitted, the proposal uses text/render metadata only
+- `Send JPG Screenshot`: optional and off by default; when enabled the browser
+  rasterizes the current CAD view to a viewer-sized JPEG and sends that image,
+  not the full SVG
+- `Temperature`: optional; some hosted models, including some Kimi-compatible
+  deployments, require `1`
+- `Timeout Seconds`: request timeout for provider calls; lower this while
+  testing provider connectivity
+- `Max Tokens`: output budget for the JSON proposal; default `1200`
+
+Environment variables can also provide defaults:
+
+```bash
+export VLLM_BASE_URL=http://127.0.0.1:8002
+export VLLM_VLM_MODEL=your-vlm-model
+# Optional:
+export VLLM_LLM_MODEL=your-llm-model
+export VLLM_API_KEY=token-if-required
+export VLLM_TIMEOUT_SECONDS=60
+export VLLM_TEMPERATURE=1
+export VLLM_MAX_TOKENS=1200
+```
+
+Then use `Auto Propose ROI/Seed` in the Agent Review panel. If no provider is
+configured, the app keeps using the manual review workflow.
+
+Agent seed candidates can be supplied as:
+
+- `template_id` from the current upload cache
+- inline `entities` plus `group_center`
+- `click_pct`
+- `polygon_pct`
+
+The agent response includes validation metadata such as match count, mean match
+score, warnings, and class/view grouping.
+
+For the full LLM/VLM automation design, provider setup, JSON contracts, and
+troubleshooting notes, see [AGENT_AUTOMATION.md](AGENT_AUTOMATION.md).
+
 ## HTTP Endpoints
 
 Core routes currently exposed by the backend:
@@ -121,6 +183,11 @@ Core routes currently exposed by the backend:
 - `GET /`
 - `GET /settings_schema`
 - `GET /template_library`
+- `GET /agent/schema`
+- `GET /agent/config`
+- `GET /agent/render/{cache_id}`
+- `POST /agent/propose`
+- `POST /agent/run`
 - `POST /template_library/create_library`
 - `POST /template_library/rename_library`
 - `POST /template_library/select_library`

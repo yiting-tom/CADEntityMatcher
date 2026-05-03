@@ -328,6 +328,12 @@
             font-size: 12px;
         }
 
+        textarea.setting-input {
+            min-height: 72px;
+            resize: vertical;
+            line-height: 1.4;
+        }
+
         .plugin-toggle {
             display: flex;
             align-items: flex-start;
@@ -343,6 +349,135 @@
             flex-direction: column;
             gap: 8px;
             margin-bottom: 10px;
+        }
+
+        .sidepanel-tabs {
+            display: flex;
+            gap: 4px;
+            margin: 8px 0 12px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+        }
+
+        .sidepanel-tabs .tab-btn {
+            background: transparent;
+            color: #aaa;
+            border: 1px solid transparent;
+            border-bottom: none;
+            border-radius: 6px 6px 0 0;
+            padding: 6px 12px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 500;
+            margin-bottom: -1px;
+        }
+
+        .sidepanel-tabs .tab-btn:hover {
+            color: #ddd;
+        }
+
+        .sidepanel-tabs .tab-btn.active {
+            background: rgba(77, 163, 255, 0.12);
+            color: #fff;
+            border-color: rgba(77, 163, 255, 0.42);
+        }
+
+        .tab-pane[hidden] {
+            display: none;
+        }
+
+        .agent-advanced {
+            margin: 4px 0 8px;
+            padding: 4px 8px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 4px;
+        }
+
+        .agent-region-list {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin-bottom: 10px;
+        }
+
+        .agent-region-card {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            padding: 6px 8px;
+            border-radius: 4px;
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            background: rgba(255, 255, 255, 0.03);
+            font-size: 11px;
+            line-height: 1.35;
+            cursor: pointer;
+        }
+
+        .agent-region-card.included {
+            border-color: rgba(77, 200, 120, 0.5);
+        }
+
+        .agent-region-card.excluded {
+            opacity: 0.65;
+        }
+
+        .agent-region-card .agent-region-head {
+            display: flex;
+            justify-content: space-between;
+            gap: 6px;
+            align-items: center;
+        }
+
+        .agent-region-card select {
+            background: rgba(0, 0, 0, 0.4);
+            color: #ddd;
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            border-radius: 3px;
+            padding: 2px 4px;
+            font-size: 11px;
+        }
+
+        .agent-region-card .agent-region-stats {
+            color: #aaa;
+        }
+
+        #agent-tile-popup {
+            position: fixed;
+            top: 16px;
+            right: 16px;
+            z-index: 50;
+            background: rgba(20, 22, 28, 0.95);
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            border-radius: 6px;
+            padding: 8px;
+            box-shadow: 0 6px 22px rgba(0, 0, 0, 0.5);
+            display: none;
+            max-width: 540px;
+            max-height: 80vh;
+            overflow: auto;
+        }
+
+        #agent-tile-popup img {
+            display: block;
+            max-width: 520px;
+            max-height: 60vh;
+            background: #fff;
+        }
+
+        #agent-tile-popup .tile-popup-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 6px;
+            font-size: 12px;
+        }
+
+        #agent-tile-popup button {
+            background: transparent;
+            color: #ddd;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 3px;
+            padding: 2px 8px;
+            cursor: pointer;
         }
 
         .library-status {
@@ -486,10 +621,12 @@
                     <svg id="svg-overlay"
                         style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:10;">
                         <g id="removed-group"></g>
+                        <g id="region-group"></g>
                         <g id="roi-group"></g>
                         <g id="poly-group"></g>
                         <g id="template-group"></g>
                         <g id="hl-group"></g>
+                        <g id="seed-group"></g>
                     </svg>
                 </div>
             </div>
@@ -498,6 +635,17 @@
                 <section class="status-card">
                     <h2>Scan Status</h2>
                     <p id="scan-status" class="status-line"></p>
+                    <div class="sidepanel-tabs" role="tablist">
+                        <button type="button" class="tab-btn active" data-tab="manual"
+                            role="tab" aria-selected="true" onclick="switchSidepanelTab('manual')">
+                            Manual
+                        </button>
+                        <button type="button" class="tab-btn" data-tab="agent"
+                            role="tab" aria-selected="false" onclick="switchSidepanelTab('agent')">
+                            Agent (LLM/VLM)
+                        </button>
+                    </div>
+                    <div class="tab-pane manual-pane" data-tab="manual">
                     <details open>
                         <summary>Template Library</summary>
                         <div class="details-body">
@@ -548,6 +696,124 @@
                             <pre id="extract-result">No data yet</pre>
                         </div>
                     </details>
+                    </div><!-- /manual-pane (top half) -->
+                    <div class="tab-pane agent-pane" data-tab="agent" hidden>
+                    <details open>
+                        <summary>Agent Review</summary>
+                        <div class="details-body">
+                            <div class="settings-stack">
+                                <label class="setting-item">
+                                    <span class="setting-title">Instruction</span>
+                                    <textarea id="agent-instruction" class="setting-input"
+                                        placeholder="Find SMD patterns in the top and bottom package views."></textarea>
+                                </label>
+                                <label class="setting-item">
+                                    <span class="setting-title">Target Classes</span>
+                                    <input id="agent-target-classes" class="setting-input" type="text" value=""
+                                        placeholder="comma separated, e.g. SMD,Substrate,Die area,Alignment mark">
+                                </label>
+                                <label class="setting-item">
+                                    <span class="setting-title">Target Descriptions</span>
+                                    <textarea id="agent-target-descriptions" class="setting-input"
+                                        rows="6"
+                                        placeholder="One per line: ClassName: what this target looks like in the drawing.&#10;Example:&#10;SMD: small repeated circular pads in arrays&#10;Substrate: large rectangular outline of the package&#10;Alignment mark: cross or L-shaped fiducials at corners"></textarea>
+                                    <span class="setting-meta">Each line "Name: description" is sent to the LLM/VLM so it knows what to look for.</span>
+                                </label>
+                                <label class="setting-item">
+                                    <span class="setting-title">Provider Base URL</span>
+                                    <input id="agent-provider-base-url" class="setting-input" type="url"
+                                        placeholder="https://api.moonshot.ai">
+                                </label>
+                                <label class="setting-item">
+                                    <span class="setting-title">Provider API Key</span>
+                                    <input id="agent-provider-api-key" class="setting-input" type="password"
+                                        placeholder="Bearer token, optional for local vLLM">
+                                </label>
+                                <label class="setting-item">
+                                    <span class="setting-title">LLM Model</span>
+                                    <input id="agent-provider-llm-model" class="setting-input" type="text"
+                                        placeholder="kimi-k2.6 or local text model">
+                                </label>
+                                <label class="setting-item">
+                                    <span class="setting-title">VLM Model</span>
+                                    <input id="agent-provider-vlm-model" class="setting-input" type="text"
+                                        placeholder="vision model, optional">
+                                </label>
+                                <label class="plugin-toggle">
+                                    <input id="agent-provider-send-image" type="checkbox">
+                                    <span>
+                                        <span class="setting-title">Send JPG Screenshot</span>
+                                        <span class="setting-meta">Sends a viewer-sized JPEG, not the full SVG.</span>
+                                    </span>
+                                </label>
+                                <label class="setting-item">
+                                    <span class="setting-title">Temperature</span>
+                                    <input id="agent-provider-temperature" class="setting-input" type="number" min="0"
+                                        max="2" step="0.1" placeholder="0, use 1 for Kimi if required">
+                                </label>
+                                <label class="setting-item">
+                                    <span class="setting-title">Timeout Seconds</span>
+                                    <input id="agent-provider-timeout" class="setting-input" type="number" min="5"
+                                        max="300" step="1" value="30">
+                                </label>
+                                <label class="setting-item">
+                                    <span class="setting-title">Max Tokens</span>
+                                    <input id="agent-provider-max-tokens" class="setting-input" type="number" min="128"
+                                        max="8192" step="128" value="1200">
+                                </label>
+                                <details class="agent-advanced">
+                                    <summary>Pipeline Tuning</summary>
+                                    <div class="settings-stack">
+                                        <label class="setting-item">
+                                            <span class="setting-title">View Grid Size</span>
+                                            <input id="agent-view-grid-size" class="setting-input" type="number"
+                                                min="8" max="128" step="1" value="32">
+                                        </label>
+                                        <label class="setting-item">
+                                            <span class="setting-title">View Density Quantile</span>
+                                            <input id="agent-view-density-quantile" class="setting-input"
+                                                type="number" min="0" max="0.9" step="0.05" value="0.10">
+                                        </label>
+                                        <label class="setting-item">
+                                            <span class="setting-title">Tile Grid per View</span>
+                                            <input id="agent-tile-grid" class="setting-input" type="number"
+                                                min="1" max="10" step="1" value="3">
+                                        </label>
+                                        <label class="setting-item">
+                                            <span class="setting-title">Tile PX Long Side</span>
+                                            <input id="agent-tile-px" class="setting-input" type="number"
+                                                min="128" max="2048" step="32" value="768">
+                                        </label>
+                                    </div>
+                                </details>
+                                <div class="library-save-fields">
+                                    <button id="btn-agent-detect-regions" class="btn-sm"
+                                        onclick="detectAgentRegions()" disabled>
+                                        Detect Regions
+                                    </button>
+                                    <button id="btn-agent-review" class="btn-sm" onclick="runAgentReview()" disabled>
+                                        Start Agent Review
+                                    </button>
+                                    <button id="btn-agent-propose" class="btn-sm" onclick="proposeAgentInputs()"
+                                        disabled>
+                                        Auto Propose ROI/Seed
+                                    </button>
+                                    <button id="btn-agent-scan-current" class="btn-sm"
+                                        onclick="runAgentWithCurrentTemplate()" disabled>
+                                        Use Current Template as Seed
+                                    </button>
+                                    <button id="btn-download-agent-json" class="btn-sm"
+                                        onclick="downloadAgentJson()" disabled>
+                                        Download Agent JSON
+                                    </button>
+                                </div>
+                                <div id="agent-region-list" class="agent-region-list"></div>
+                                <pre id="agent-result">Waiting for agent review...</pre>
+                            </div>
+                        </div>
+                    </details>
+                    </div><!-- /agent-pane -->
+                    <div class="tab-pane manual-pane" data-tab="manual">
                     <details>
                         <summary>Matches</summary>
                         <div class="details-body">
@@ -562,12 +828,20 @@
                             </div>
                         </div>
                     </details>
+                    </div><!-- /manual-pane (bottom) -->
                 </section>
             </div>
 
             <div class="floating-hint">
                 <p id="selection-hint" class="hint">Left-click to add vertex. Double-click or click the first point to
                     close. Right-drag to pan. Scroll to zoom. Press ESC to clear.</p>
+            </div>
+            <div id="agent-tile-popup">
+                <div class="tile-popup-head">
+                    <span id="agent-tile-popup-label">Tile preview</span>
+                    <button onclick="hideAgentTilePopup()">Close</button>
+                </div>
+                <img id="agent-tile-popup-img" alt="tile preview">
             </div>
         </main>
     </div>
@@ -587,6 +861,11 @@
         const btnRemoveEntities = document.getElementById('btn-remove-entities');
         const btnDownloadMatchedDxf = document.getElementById('btn-download-matched-dxf');
         const btnDownloadMatchesJson = document.getElementById('btn-download-matches-json');
+        const btnAgentReview = document.getElementById('btn-agent-review');
+        const btnAgentPropose = document.getElementById('btn-agent-propose');
+        const btnAgentScanCurrent = document.getElementById('btn-agent-scan-current');
+        const btnDownloadAgentJson = document.getElementById('btn-download-agent-json');
+        const agentResult = document.getElementById('agent-result');
         const selectionHint = document.getElementById('selection-hint');
         const settingsContainer = document.getElementById('settings-container');
         const templateLibraryContainer = document.getElementById('template-library-container');
@@ -609,6 +888,7 @@
         let currentTemplate = null;
         let currentTemplateBundle = null;
         let currentMatchResult = null;
+        let currentAgentResult = null;
         let currentCacheId = null;
         let settingsSchema = { plugins: [], hyperparameters: [] };
         let templateLibraryData = { categories: [], template_count: 0 };
@@ -1253,11 +1533,257 @@
             document.getElementById('btn-scan').disabled = !canScan;
             btnRemoveEntities.disabled = !canRemove;
             updateSaveTemplateButton();
+            updateAgentButtons();
         }
 
         function setMatchButtonsEnabled(enabled) {
             btnDownloadMatchedDxf.disabled = !enabled;
             btnDownloadMatchesJson.disabled = !enabled;
+        }
+
+        function updateAgentButtons() {
+            btnAgentReview.disabled = !currentCacheId;
+            btnAgentPropose.disabled = !currentCacheId;
+            btnAgentScanCurrent.disabled = !(currentCacheId && currentTemplate);
+            btnDownloadAgentJson.disabled = !currentAgentResult;
+            var btnRegions = document.getElementById('btn-agent-detect-regions');
+            if (btnRegions) btnRegions.disabled = !currentCacheId;
+        }
+
+        function switchSidepanelTab(tab) {
+            document.querySelectorAll('.sidepanel-tabs .tab-btn').forEach(function (btn) {
+                var active = btn.getAttribute('data-tab') === tab;
+                btn.classList.toggle('active', active);
+                btn.setAttribute('aria-selected', active ? 'true' : 'false');
+            });
+            document.querySelectorAll('.tab-pane').forEach(function (pane) {
+                if (pane.getAttribute('data-tab') === tab) {
+                    pane.removeAttribute('hidden');
+                } else {
+                    pane.setAttribute('hidden', '');
+                }
+            });
+        }
+
+        // --- Agent regions/tiles/seeds overlay ---
+        var REGION_LABEL_STYLE = {
+            view:        { stroke: '#3ad28a', fill: 'rgba(58,210,138,0.12)' },
+            detail:      { stroke: '#4dd1ff', fill: 'rgba(77,209,255,0.12)' },
+            table:       { stroke: '#ffa726', fill: 'rgba(255,167,38,0.10)' },
+            title_block: { stroke: '#b370ff', fill: 'rgba(179,112,255,0.10)' },
+            dimension:   { stroke: '#9aa0a6', fill: 'rgba(154,160,166,0.08)' },
+            note:        { stroke: '#ffd54f', fill: 'rgba(255,213,79,0.10)' },
+            unknown:     { stroke: '#cfd8dc', fill: 'rgba(207,216,220,0.06)' },
+        };
+        var REGION_LABEL_OPTIONS = [
+            'view', 'detail', 'table', 'title_block', 'dimension', 'note', 'unknown'
+        ];
+        var currentRegions = [];
+        var currentSeedCandidates = [];
+
+        function getAgentPipelineSettings() {
+            return {
+                view_grid_size: Number(document.getElementById('agent-view-grid-size').value || 32),
+                view_density_quantile: Number(document.getElementById('agent-view-density-quantile').value || 0.10),
+                tile_grid_per_view: Number(document.getElementById('agent-tile-grid').value || 3),
+                tile_px_long_side: Number(document.getElementById('agent-tile-px').value || 768),
+            };
+        }
+
+        async function detectAgentRegions() {
+            if (!currentCacheId) return;
+            var s = getAgentPipelineSettings();
+            var url = '/agent/regions/' + encodeURIComponent(currentCacheId)
+                + '?grid_size=' + s.view_grid_size
+                + '&density_quantile=' + s.view_density_quantile;
+            agentResult.innerText = 'Detecting regions...';
+            try {
+                var res = await fetch(url);
+                var data = await res.json();
+                if (!res.ok || data.error) {
+                    agentResult.innerText = JSON.stringify(data, null, 2);
+                    return;
+                }
+                currentRegions = data.regions || [];
+                renderAgentRegions(currentRegions);
+                renderAgentRegionList(currentRegions);
+                agentResult.innerText = JSON.stringify({
+                    summary: data.summary,
+                    regions: currentRegions.map(function (r) {
+                        return {
+                            id: r.id,
+                            label: r.label,
+                            confidence: r.label_confidence,
+                            view_name: r.view_name,
+                            entity_count: r.entity_count,
+                            roi_pct: r.roi_pct,
+                        };
+                    }),
+                }, null, 2);
+            } catch (err) {
+                agentResult.innerText = 'Region detection failed: ' + String(err);
+            }
+        }
+
+        function clearAgentRegions() {
+            var g = document.getElementById('region-group');
+            if (g) g.innerHTML = '';
+        }
+
+        function renderAgentRegions(regions) {
+            var NS = 'http://www.w3.org/2000/svg';
+            var g = document.getElementById('region-group');
+            if (!g) return;
+            g.innerHTML = '';
+            (regions || []).forEach(function (region) {
+                var roi = region.roi_pct;
+                if (!roi || roi.length !== 2) return;
+                var a = svgPctToContent(roi[0][0], roi[0][1]);
+                var b = svgPctToContent(roi[1][0], roi[1][1]);
+                var x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
+                var w = Math.abs(b.x - a.x), h = Math.abs(b.y - a.y);
+                var style = REGION_LABEL_STYLE[region.label] || REGION_LABEL_STYLE.unknown;
+                var rect = document.createElementNS(NS, 'rect');
+                rect.setAttribute('x', x); rect.setAttribute('y', y);
+                rect.setAttribute('width', w); rect.setAttribute('height', h);
+                rect.setAttribute('fill', style.fill);
+                rect.setAttribute('stroke', style.stroke);
+                rect.setAttribute('stroke-width', 2 / scale);
+                rect.setAttribute('stroke-dasharray', (5 / scale) + ' ' + (4 / scale));
+                g.appendChild(rect);
+                var fontSize = Math.max(12 / scale, 1);
+                var label = (region.view_name || region.id) + ' [' + region.label
+                    + (region.label_confidence != null ? (' ' + Number(region.label_confidence).toFixed(2)) : '')
+                    + ']';
+                var txt = document.createElementNS(NS, 'text');
+                txt.setAttribute('x', x + 4 / scale);
+                txt.setAttribute('y', y + fontSize + 2 / scale);
+                txt.setAttribute('fill', style.stroke);
+                txt.setAttribute('stroke', '#000');
+                txt.setAttribute('stroke-width', 3 / scale);
+                txt.setAttribute('paint-order', 'stroke');
+                txt.setAttribute('font-size', fontSize);
+                txt.setAttribute('font-family', 'ui-monospace,monospace');
+                txt.setAttribute('pointer-events', 'none');
+                txt.textContent = label;
+                g.appendChild(txt);
+            });
+        }
+
+        function renderAgentRegionList(regions) {
+            var container = document.getElementById('agent-region-list');
+            if (!container) return;
+            container.innerHTML = '';
+            if (!regions || !regions.length) {
+                container.innerHTML = '<div class="setting-meta">No regions detected.</div>';
+                return;
+            }
+            regions.forEach(function (region) {
+                var card = document.createElement('div');
+                card.className = 'agent-region-card '
+                    + (region.included_in_pipeline ? 'included' : 'excluded');
+                var head = document.createElement('div');
+                head.className = 'agent-region-head';
+                var heading = document.createElement('span');
+                heading.textContent = (region.view_name || region.id) + ' · ' + region.entity_count + ' ents';
+                head.appendChild(heading);
+                var select = document.createElement('select');
+                REGION_LABEL_OPTIONS.forEach(function (opt) {
+                    var o = document.createElement('option');
+                    o.value = opt; o.textContent = opt;
+                    if (opt === region.label) o.selected = true;
+                    select.appendChild(o);
+                });
+                select.addEventListener('change', function (e) {
+                    e.stopPropagation();
+                    region.label = select.value;
+                    region.included_in_pipeline = (select.value === 'view' || select.value === 'detail');
+                    region.label_source = 'human';
+                    renderAgentRegions(currentRegions);
+                    renderAgentRegionList(currentRegions);
+                });
+                select.addEventListener('click', function (e) { e.stopPropagation(); });
+                head.appendChild(select);
+                card.appendChild(head);
+                var stats = document.createElement('div');
+                stats.className = 'agent-region-stats';
+                var f = region.features || {};
+                stats.textContent = 'C=' + (f.circle_share || 0).toFixed(2)
+                    + ' S=' + (f.structural_share || 0).toFixed(2)
+                    + ' T=' + (f.text_share || 0).toFixed(2)
+                    + ' D=' + (f.dimension_share || 0).toFixed(2)
+                    + ' rep=' + (f.repetition_entropy || 0).toFixed(2)
+                    + ' ar=' + (f.aspect_ratio || 0).toFixed(2);
+                card.appendChild(stats);
+                if (region.label_reasons && region.label_reasons.length) {
+                    var reasons = document.createElement('div');
+                    reasons.className = 'agent-region-stats';
+                    reasons.textContent = region.label_reasons.join(', ');
+                    card.appendChild(reasons);
+                }
+                card.addEventListener('click', function () {
+                    previewAgentTile(region.roi_pct, region.view_name || region.id);
+                });
+                container.appendChild(card);
+            });
+        }
+
+        function previewAgentTile(roiPct, label) {
+            if (!currentCacheId || !roiPct) return;
+            var px = Number(document.getElementById('agent-tile-px').value || 768);
+            var url = '/agent/tile/' + encodeURIComponent(currentCacheId)
+                + '?x0=' + roiPct[0][0]
+                + '&y0=' + roiPct[0][1]
+                + '&x1=' + roiPct[1][0]
+                + '&y1=' + roiPct[1][1]
+                + '&px=' + Math.max(128, Math.min(px, 2048));
+            var popup = document.getElementById('agent-tile-popup');
+            var img = document.getElementById('agent-tile-popup-img');
+            var head = document.getElementById('agent-tile-popup-label');
+            head.textContent = 'Tile: ' + label;
+            img.src = url + '&_=' + Date.now();
+            popup.style.display = 'block';
+        }
+
+        function hideAgentTilePopup() {
+            var popup = document.getElementById('agent-tile-popup');
+            if (popup) popup.style.display = 'none';
+        }
+
+        function clearAgentSeeds() {
+            var g = document.getElementById('seed-group');
+            if (g) g.innerHTML = '';
+        }
+
+        function renderAgentSeeds(seeds) {
+            var NS = 'http://www.w3.org/2000/svg';
+            var g = document.getElementById('seed-group');
+            if (!g) return;
+            g.innerHTML = '';
+            (seeds || []).forEach(function (seed, idx) {
+                if (seed.polygon_pct && seed.polygon_pct.length >= 3) {
+                    var pts = seed.polygon_pct.map(function (p) {
+                        var c = svgPctToContent(p[0], p[1]);
+                        return c.x + ',' + c.y;
+                    }).join(' ');
+                    var poly = document.createElementNS(NS, 'polygon');
+                    poly.setAttribute('points', pts);
+                    poly.setAttribute('fill', 'rgba(255,80,160,0.15)');
+                    poly.setAttribute('stroke', '#ff50a0');
+                    poly.setAttribute('stroke-width', 1.5 / scale);
+                    g.appendChild(poly);
+                } else if (seed.click_pct) {
+                    var c = svgPctToContent(seed.click_pct[0], seed.click_pct[1]);
+                    var circle = document.createElementNS(NS, 'circle');
+                    circle.setAttribute('cx', c.x);
+                    circle.setAttribute('cy', c.y);
+                    circle.setAttribute('r', 6 / scale);
+                    circle.setAttribute('fill', 'rgba(255,80,160,0.35)');
+                    circle.setAttribute('stroke', '#ff50a0');
+                    circle.setAttribute('stroke-width', 1.5 / scale);
+                    g.appendChild(circle);
+                }
+            });
         }
 
         function makeEntityKey(entity) {
@@ -1368,6 +1894,12 @@
                 var a = svgPctToContent(roiPct[0][0], roiPct[0][1]);
                 var b = svgPctToContent(roiPct[1][0], roiPct[1][1]);
                 drawRoiRect(a, b);
+            }
+            if (typeof currentRegions !== 'undefined' && currentRegions && currentRegions.length) {
+                renderAgentRegions(currentRegions);
+            }
+            if (typeof currentSeedCandidates !== 'undefined' && currentSeedCandidates && currentSeedCandidates.length) {
+                renderAgentSeeds(currentSeedCandidates);
             }
         }
         function syncCanvasSize() {
@@ -1528,6 +2060,351 @@
             var filename = baseName + '.json';
             downloadJson(filename, payload);
         }
+
+        function getAgentInstruction() {
+            return document.getElementById('agent-instruction').value.trim()
+                || 'Find matching CAD patterns for the reviewed seed template.';
+        }
+
+        function getAgentTargetClasses() {
+            var raw = document.getElementById('agent-target-classes').value || '';
+            var classes = raw.split(',')
+                .map(function (item) { return item.trim(); })
+                .filter(function (item) { return !!item; });
+            // Also pull names from the descriptions textarea (each line "Name: ...").
+            var descMap = getAgentTargetDescriptions();
+            Object.keys(descMap).forEach(function (name) {
+                if (classes.indexOf(name) < 0) classes.push(name);
+            });
+            return classes.length ? classes : ['SMD'];
+        }
+
+        function getAgentTargetDescriptions() {
+            var el = document.getElementById('agent-target-descriptions');
+            var raw = el ? el.value : '';
+            var out = {};
+            if (!raw) return out;
+            raw.split(/\r?\n/).forEach(function (line) {
+                var trimmed = line.trim();
+                if (!trimmed) return;
+                var sep = trimmed.indexOf(':');
+                if (sep <= 0) return;
+                var name = trimmed.slice(0, sep).trim();
+                var desc = trimmed.slice(sep + 1).trim();
+                if (name) out[name] = desc;
+            });
+            return out;
+        }
+
+        function getAgentViewsPayload() {
+            if (roiEnabled && roiPct) {
+                return [{
+                    name: document.getElementById('roi-name-input').value.trim() || 'review_roi',
+                    roi_pct: roiPct,
+                    confidence: 1.0,
+                    source: 'human_review',
+                }];
+            }
+            return [];
+        }
+
+        function buildAgentBasePayload() {
+            return {
+                cache_id: currentCacheId,
+                instruction: getAgentInstruction(),
+                target_classes: getAgentTargetClasses(),
+                target_descriptions: getAgentTargetDescriptions(),
+                views: getAgentViewsPayload(),
+                plugins: collectSelectedPlugins(),
+                settings: collectRuntimeSettings(),
+            };
+        }
+
+        function getAgentProviderPayload() {
+            var baseUrl = document.getElementById('agent-provider-base-url').value.trim();
+            var apiKey = document.getElementById('agent-provider-api-key').value.trim();
+            var llmModel = document.getElementById('agent-provider-llm-model').value.trim();
+            var vlmModel = document.getElementById('agent-provider-vlm-model').value.trim();
+            var sendImage = document.getElementById('agent-provider-send-image').checked;
+            var temperatureRaw = document.getElementById('agent-provider-temperature').value.trim();
+            var timeoutRaw = document.getElementById('agent-provider-timeout').value.trim();
+            var maxTokensRaw = document.getElementById('agent-provider-max-tokens').value.trim();
+            if (!baseUrl && !apiKey && !llmModel && !vlmModel && !sendImage && !temperatureRaw && !timeoutRaw && !maxTokensRaw) return null;
+            var provider = {
+                base_url: baseUrl || null,
+                api_key: apiKey || null,
+                llm_model: llmModel || null,
+                vlm_model: vlmModel || null,
+                send_image: sendImage,
+            };
+            if (temperatureRaw) provider.temperature = Number(temperatureRaw);
+            if (timeoutRaw) provider.timeout_seconds = Number(timeoutRaw);
+            if (maxTokensRaw) provider.max_tokens = Number(maxTokensRaw);
+            return provider;
+        }
+
+        function buildViewerJpegDataUrl() {
+            return new Promise(function (resolve, reject) {
+                var svg = svgDisplay.querySelector('svg');
+                if (!svg) {
+                    resolve(null);
+                    return;
+                }
+                var width = Math.max(1, Math.round(svgDisplay.clientWidth || container.clientWidth || 1024));
+                var height = Math.max(1, Math.round(svgDisplay.clientHeight || container.clientHeight || 768));
+                var clone = svg.cloneNode(true);
+                clone.setAttribute('width', width);
+                clone.setAttribute('height', height);
+                clone.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+                if (!clone.getAttribute('xmlns')) {
+                    clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+                }
+                var serialized = new XMLSerializer().serializeToString(clone);
+                var blob = new Blob([serialized], { type: 'image/svg+xml;charset=utf-8' });
+                var url = URL.createObjectURL(blob);
+                var img = new Image();
+                img.onload = function () {
+                    try {
+                        var canvas = document.createElement('canvas');
+                        canvas.width = width;
+                        canvas.height = height;
+                        var ctx = canvas.getContext('2d');
+                        ctx.fillStyle = '#000000';
+                        ctx.fillRect(0, 0, width, height);
+                        ctx.drawImage(img, 0, 0, width, height);
+                        URL.revokeObjectURL(url);
+                        resolve(canvas.toDataURL('image/jpeg', 0.78));
+                    } catch (err) {
+                        URL.revokeObjectURL(url);
+                        reject(err);
+                    }
+                };
+                img.onerror = function () {
+                    URL.revokeObjectURL(url);
+                    reject(new Error('Unable to rasterize SVG preview as JPEG.'));
+                };
+                img.src = url;
+            });
+        }
+
+        function buildCurrentTemplateSeed() {
+            if (!currentTemplate) return null;
+            var targetClass = getAgentTargetClasses()[0] || 'SMD';
+            var seed = {
+                target_class: targetClass,
+                view_name: (roiEnabled && roiPct)
+                    ? (document.getElementById('roi-name-input').value.trim() || 'review_roi')
+                    : null,
+                label: currentTemplate.name || 'Current template',
+                confidence: 1.0,
+                source: 'human_review',
+            };
+            if (currentTemplate.template_id && currentTemplate.cache_id === currentCacheId) {
+                seed.template_id = currentTemplate.template_id;
+            } else if (currentTemplate.entities && currentTemplate.entities.length) {
+                seed.entities = currentTemplate.entities;
+                seed.group_center = currentTemplate.group_center || null;
+            } else if (currentTemplate.entities_preview && currentTemplate.entities_preview.length) {
+                seed.entities = currentTemplate.entities_preview;
+                seed.group_center = currentTemplate.group_center || null;
+            }
+            return seed;
+        }
+
+        function setAgentPreview(data) {
+            currentAgentResult = data || null;
+            updateAgentButtons();
+            if (!data) {
+                agentResult.innerText = 'Waiting for agent review...';
+                return;
+            }
+            var preview = {
+                status: data.status,
+                review_required: data.review_required,
+                next_action: data.next_action || null,
+                target_classes: data.target_classes || [],
+                views: data.views || [],
+                results: (data.results || []).map(function (result) {
+                    return {
+                        target_class: result.target_class,
+                        view_name: result.view_name,
+                        status: result.status,
+                        validation: result.validation || null,
+                        error: result.error || null,
+                    };
+                }),
+            };
+            agentResult.innerText = JSON.stringify(preview, null, 2);
+        }
+
+        function collectAgentMatches(data) {
+            var out = [];
+            (data.results || []).forEach(function (result) {
+                var scan = result.scan || {};
+                (scan.matches || []).forEach(function (match) {
+                    match.template_name = result.seed && result.seed.label
+                        ? result.seed.label
+                        : (result.target_class || 'Agent');
+                    match.template_category = result.target_class || 'Agent';
+                    match.agent_view = result.view_name || null;
+                    out.push(match);
+                });
+            });
+            out.sort(function (a, b) {
+                var as = a.match_score == null ? Number.POSITIVE_INFINITY : a.match_score;
+                var bs = b.match_score == null ? Number.POSITIVE_INFINITY : b.match_score;
+                return as - bs;
+            });
+            return out;
+        }
+
+        async function runAgentPayload(payload) {
+            if (!currentCacheId) return;
+            agentResult.innerText = 'Running agent pipeline...';
+            var res = await fetch('/agent/run', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+            var data = await res.json();
+            setAgentPreview(data);
+            if (!res.ok || data.error) {
+                document.getElementById('scan-status').innerText = data.error || 'Agent pipeline failed.';
+                return data;
+            }
+            var matches = collectAgentMatches(data);
+            if (matches.length) {
+                currentMatchResult = {
+                    source: 'agent',
+                    match_count: matches.length,
+                    matches: matches,
+                    agent: data,
+                };
+                document.getElementById('scan-status').innerText =
+                    'Agent scan complete. Found ' + matches.length + ' matches.';
+                setScanPreview(currentMatchResult);
+                renderHighlights(matches);
+                setMatchButtonsEnabled(true);
+            } else if (data.status === 'needs_review') {
+                document.getElementById('scan-status').innerText =
+                    'Agent review started. Confirm ROI and select a seed template.';
+            } else {
+                document.getElementById('scan-status').innerText =
+                    'Agent scan complete. No matches found.';
+                setMatchButtonsEnabled(false);
+            }
+            return data;
+        }
+
+        async function proposeAgentInputs() {
+            if (!currentCacheId) return;
+            agentResult.innerText = 'Requesting vLLM proposal...';
+            var providerForTimeout = getAgentProviderPayload();
+            var pipeline = getAgentPipelineSettings();
+            // Tile-based flow can run many VLM calls; widen browser timeout proportionally.
+            var perTileTimeout = (providerForTimeout && providerForTimeout.timeout_seconds) || 30;
+            var tileGrid = pipeline.tile_grid_per_view || 3;
+            var estimatedTiles = Math.max(1, tileGrid * tileGrid);
+            var browserTimeoutSeconds = perTileTimeout * (estimatedTiles + 2) + 10;
+            var controller = new AbortController();
+            var abortTimer = window.setTimeout(function () {
+                controller.abort();
+            }, browserTimeoutSeconds * 1000);
+            var settings = Object.assign({}, collectRuntimeSettings(), pipeline);
+            var payload = {
+                cache_id: currentCacheId,
+                instruction: getAgentInstruction(),
+                target_classes: getAgentTargetClasses(),
+                target_descriptions: getAgentTargetDescriptions(),
+                views: getAgentViewsPayload(),
+                settings: settings,
+            };
+            if (providerForTimeout) payload.provider = providerForTimeout;
+            var res, data, text;
+            try {
+                res = await fetch('/agent/propose', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                    signal: controller.signal,
+                });
+                text = await res.text();
+                try {
+                    data = text ? JSON.parse(text) : {};
+                } catch (err) {
+                    data = {
+                        error: 'Agent proposal returned a non-JSON response.',
+                        detail: text.slice(0, 1000),
+                    };
+                }
+            } catch (err) {
+                data = {
+                    error: err.name === 'AbortError'
+                        ? 'Agent proposal request timed out in the browser.'
+                        : 'Agent proposal request failed.',
+                    detail: String(err),
+                };
+                res = { ok: false };
+            } finally {
+                window.clearTimeout(abortTimer);
+            }
+            currentAgentResult = data;
+            updateAgentButtons();
+            if (!res.ok || data.error) {
+                agentResult.innerText = JSON.stringify(data, null, 2);
+                document.getElementById('scan-status').innerText =
+                    data.error || 'Agent proposal failed.';
+                return;
+            }
+            var proposal = data.proposal || {};
+            currentRegions = proposal.regions || [];
+            currentSeedCandidates = proposal.seed_candidates || [];
+            renderAgentRegions(currentRegions);
+            renderAgentRegionList(currentRegions);
+            renderAgentSeeds(currentSeedCandidates);
+            var runPayload = buildAgentBasePayload();
+            runPayload.views = proposal.views || runPayload.views;
+            runPayload.seed_candidates = currentSeedCandidates;
+            if (!runPayload.seed_candidates.length) {
+                setAgentPreview({
+                    status: 'needs_review',
+                    review_required: true,
+                    next_action: 'confirm_view_rois_and_add_seed_candidates',
+                    target_classes: payload.target_classes,
+                    views: runPayload.views,
+                    results: [],
+                    proposal: proposal,
+                });
+                document.getElementById('scan-status').innerText =
+                    'Agent proposal returned ROI only. Select or confirm a seed.';
+                return;
+            }
+            await runAgentPayload(runPayload);
+        }
+
+        async function runAgentReview() {
+            if (!currentCacheId) return;
+            var payload = buildAgentBasePayload();
+            await runAgentPayload(payload);
+        }
+
+        async function runAgentWithCurrentTemplate() {
+            if (!currentCacheId || !currentTemplate) return;
+            var seed = buildCurrentTemplateSeed();
+            if (!seed || !(seed.template_id || (seed.entities && seed.entities.length))) {
+                agentResult.innerText = 'Current template cannot be used as a seed. Re-select it or load a saved template with entities.';
+                return;
+            }
+            var payload = buildAgentBasePayload();
+            payload.seed_candidates = [seed];
+            await runAgentPayload(payload);
+        }
+
+        function downloadAgentJson() {
+            if (!currentAgentResult) return;
+            downloadJson('agent_review_result.json', currentAgentResult);
+        }
+
         async function downloadMatchedDXF() {
             if (!currentMatchResult || !currentCacheId) return;
             var res = await fetch('/download_matched_dxf', {
@@ -1579,6 +2456,8 @@
             var data = await res.json();
             if (data.svg && data.cache_id) {
                 currentCacheId = data.cache_id;
+                currentAgentResult = null;
+                updateAgentButtons();
                 svgDisplay.innerHTML = data.svg;
                 requestAnimationFrame(function () {
                     syncCanvasSize();
@@ -1606,6 +2485,8 @@
                 });
             } else {
                 currentCacheId = null;
+                currentAgentResult = null;
+                updateAgentButtons();
                 uploadResult.innerText = JSON.stringify(data, null, 2);
             }
         }
@@ -2040,11 +2921,20 @@
             removedHighlights = [];
             removedG.innerHTML = '';
             clearRoi();
+            clearAgentRegions();
+            clearAgentSeeds();
+            currentRegions = [];
+            currentSeedCandidates = [];
+            renderAgentRegionList([]);
+            hideAgentTilePopup();
             currentCacheId = null;
+            currentAgentResult = null;
             resetView();
             document.getElementById('scan-status').innerText = '';
             document.getElementById('scan-result').innerText = 'Waiting for scan...';
+            agentResult.innerText = 'Waiting for agent review...';
             setMatchButtonsEnabled(false);
+            updateAgentButtons();
         }
 
         // --- ROI ---
